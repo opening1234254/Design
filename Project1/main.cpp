@@ -1,4 +1,7 @@
-// Self-contained Win32 application. Unicode UI text uses escapes for CP936/UTF-8 compatibility.
+﻿// 单文件 wxWidgets 逻辑电路编辑器：界面、仿真、保存读取和 KiCad 导出均集中在本文件。
+// 文件编码：UTF-8 带 BOM，行尾：Windows CRLF；中文界面字符串继续使用 Unicode 转义。
+// 维护约定：修改功能、引脚定义、算法或导出行为时，必须同步更新相关中文注释，删除失效说明。
+// 注释描述当前实现与约束；不要将待实现功能写成已经支持的功能。
 #ifndef UNICODE
 #define UNICODE
 #endif
@@ -7,13 +10,22 @@
 #endif
 #define _WIN32_WINNT 0x0601
 #define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <windowsx.h>
 #include <commdlg.h>
 #include <commctrl.h>
 #include <objbase.h>
-#include <uxtheme.h>
-#include <dwmapi.h>
+#include <wx/wx.h>
+#include <wx/treectrl.h>
+#include <wx/dcbuffer.h>
+#include <wx/popupwin.h>
+#include <wx/display.h>
+#include <wx/tglbtn.h>
+#include <wx/bmpbndl.h>
+#include <wx/scrolwin.h>
+#include <wx/timer.h>
 #include <algorithm>
 #include <array>
 #include <climits>
@@ -38,23 +50,25 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "ole32.lib")
-#pragma comment(lib, "uxtheme.lib")
-#pragma comment(lib, "dwmapi.lib")
+
+
 #pragma comment(linker,"/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #endif
 
 namespace {
 
+// 界面与几何参数：元件和导线吸附到网格，方向编号依次为右、下、左、上。
 constexpr int Grid = 20;
-constexpr int SidebarWidth = 350;
-constexpr int PropertyWidth = 310;
+
+
 constexpr COLORREF Blue = RGB(22, 132, 232);
 constexpr COLORREF Dark = RGB(39, 49, 59);
-constexpr COLORREF MenuSurface = RGB(243, 243, 243);
-constexpr COLORREF ToolbarSurface = RGB(243, 243, 243);
+
+
 constexpr int DirectionX[4] = {1, 0, -1, 0};
 constexpr int DirectionY[4] = {0, 1, 0, -1};
 constexpr wchar_t const* DirectionNames[4] = {L"\u53F3", L"\u4E0B", L"\u5DE6", L"\u4E0A"};
+// 元件显示名称、文件格式键名及 Kind 枚举必须保持相同顺序；新增元件时应同步维护。
 constexpr wchar_t const* KindNames[] = {L"\u4E0E\u95E8", L"\u6216\u95E8", L"\u975E\u95E8", L"\u8F93\u5165\u5F15\u811A", L"\u8F93\u51FA\u5F15\u811A",
     L"\u5F02\u6216\u95E8", L"\u4E0E\u975E\u95E8", L"\u6216\u975E\u95E8", L"\u540C\u6216\u95E8", L"\u534A\u52A0\u5668", L"\u534A\u51CF\u5668", L"\u76F8\u7B49\u6BD4\u8F83\u5668", L"D \u89E6\u53D1\u5668", L"RS \u9501\u5B58\u5668", L"\u65F6\u949F\uFF08\u624B\u52A8\uFF09", L"\u903B\u8F91\u5E38\u91CF"};
 constexpr char const* KindKeys[] = {"and", "or", "not", "input", "output",
@@ -64,14 +78,16 @@ enum Kind { And, Or, Not, Input, Output, Xor, Nand, Nor, Xnor, HalfAdder, HalfSu
 enum Tool { SelectTool, WireTool, AndTool, OrTool, NotTool, InputTool, OutputTool,
             XorTool, NandTool, NorTool, XnorTool, HalfAdderTool, HalfSubtractorTool, EqualTool, DFlipFlopTool, RSLatchTool, ClockTool, ConstantTool };
 
+// 画布中的逻辑元件。value 对信号源表示电平，对触发器表示保存的 Q 状态。
 struct Component {
     int id = 0;
     Kind kind = And;
     int x = 0, y = 0, direction = 0, inputs = 2;
     bool value = false;
-    bool lastClock = false; // Saved edge history for D flip-flops.
+    bool lastClock = false; // D 触发器上次观察到的时钟电平，保存后用于避免重复采样。
 };
 
+// 逻辑连接以元件编号和端口编号为准；bends、parentWire 和 tap 只描述折点与分支显示。
 struct Wire {
     int id = 0;
     int source = 0, target = 0, port = 0;
@@ -83,10 +99,11 @@ struct Wire {
 
 struct Port {
     int component = 0;
-    int index = -1; // -1 is output; 0..7 are inputs.
+    int index = -1; // -1 为主输出，-2 为第二输出；0..7 为输入。不要与物理焊盘编号混淆。
     POINT point{};
 };
 
+// 可保存、可撤销的电路模型；编号计数器用于为新元件和导线分配标识。
 struct Circuit {
     std::vector<Component> components;
     std::vector<Wire> wires;
@@ -99,8 +116,9 @@ int snap(int value) { return static_cast<int>(std::round(static_cast<double>(val
 POINT pt(int x, int y) { return POINT{x, y}; }
 bool is_source(Kind kind) { return kind == Input || kind == Clock || kind == Constant; }
 bool sequential(Kind kind) { return kind == DFlipFlop || kind == RSLatch; }
+// 逻辑输入端口数：D 触发器为 D/CLK/CLR/SET（旧 CLR 索引不变）；RS 为 S/R。信号源的实际端口由 ports 特殊处理。
 int input_count(Component const& c) {
-    if (c.kind == DFlipFlop) return 3;
+    if (c.kind == DFlipFlop) return 4;
     return c.kind == Not || c.kind == Output ? 1 :
            c.kind >= HalfAdder ? 2 : c.inputs;
 }
@@ -123,16 +141,24 @@ std::vector<int> input_offsets(int count) {
 }
 
 int half_height(Component const& c) {
-    if (sequential(c.kind)) return 60;
+    if (sequential(c.kind)) return 80;
     int result = 23;
     for (int offset : input_offsets(input_count(c))) result = std::max(result, std::abs(offset) + 12);
     return result;
 }
 
+// 统一生成端口的位置和逻辑索引，供连线、命中检测、绘制及导出使用。D/CLK 在左、SET/CLR 在上下、Q/反相 Q 在右；保留旧 CLR 索引 2，新增 SET 索引 3。
 std::vector<Port> ports(Component const& c) {
     std::vector<Port> result;
     int dx = DirectionX[c.direction], dy = DirectionY[c.direction];
-    if (is_source(c.kind)) {
+    if (sequential(c.kind)) {
+        auto add = [&](int index, int x, int y) {
+            result.push_back({c.id,index,pt(c.x+x*dx-y*dy,c.y+x*dy+y*dx)});
+        };
+        add(0,-80,-40); add(1,-80,c.kind == DFlipFlop ? 20 : 40);
+        if (c.kind == DFlipFlop) { add(2,0,100); add(3,0,-100); }
+        add(-1,80,-40); add(-2,80,40);
+    } else if (is_source(c.kind)) {
         result.push_back({c.id, -1, pt(c.x + 40 * dx, c.y + 40 * dy)});
     } else if (c.kind == Output) {
         result.push_back({c.id, 0, pt(c.x - 40 * dx, c.y - 40 * dy)});
@@ -177,8 +203,9 @@ POINT port_point(Component const& component, int index) {
 RECT component_bounds(Component const& c) {
     if (is_source(c.kind) || c.kind == Output) return RECT{c.x - 20, c.y - 20, c.x + 20, c.y + 20};
     int h = half_height(c);
-    int hx = c.direction % 2 == 0 ? 23 : h;
-    int hy = c.direction % 2 == 0 ? h : 23;
+    int w = sequential(c.kind) ? 60 : 23;
+    int hx = c.direction % 2 == 0 ? w : h;
+    int hy = c.direction % 2 == 0 ? h : w;
     return RECT{c.x - hx, c.y - hy, c.x + hx, c.y + hy};
 }
 
@@ -195,7 +222,7 @@ bool blocked(POINT p, std::vector<Component> const& components) {
             int dx = DirectionX[c.direction], dy = DirectionY[c.direction];
             int forward = std::abs((p.x - c.x) * dx + (p.y - c.y) * dy);
             int across = std::abs((p.x - c.x) * -dy + (p.y - c.y) * dx);
-            if (forward <= 20 && across <= half_height(c)) return true;
+            if (forward <= (sequential(c.kind) ? 60 : 20) && across <= half_height(c)) return true;
         }
     }
     return false;
@@ -208,6 +235,7 @@ struct RouteQueueItem {
     bool operator<(RouteQueueItem const& rhs) const { return score > rhs.score; }
 };
 
+// 网格寻路：绕开元件，考虑转弯与首尾方向；生成正交导线。这里仅处理画布走线，不是 PCB 自动布线。
 std::vector<POINT> grid_route(POINT start, POINT end, std::vector<Component> const& components,
                               int firstDirection = -1, int lastDirection = -1) {
     if (same(start, end)) return {start};
@@ -282,7 +310,8 @@ std::vector<POINT> route_points(Circuit const& circuit, Component const& source,
     for (size_t i = 0; i < destinations.size(); ++i) {
         auto leg = grid_route(result.back(), destinations[i], circuit.components,
                               i == 0 && !branchStart ? source.direction : -1,
-                              hasEnd && i + 1 == destinations.size() ? target->direction : -1);
+                              hasEnd && i + 1 == destinations.size() ?
+                              (target->direction + (target->kind == DFlipFlop && inputPort == 2 ? 3 : target->kind == DFlipFlop && inputPort == 3 ? 1 : 0)) % 4 : -1);
         if (leg.empty()) {
             if (!bends.empty()) return route_points(circuit, source, target, inputPort, {}, hover, branchStart, sourcePort);
             return {};
@@ -303,6 +332,7 @@ POINT nearest_route_point(std::vector<POINT> const& route, POINT wanted) {
     return closest;
 }
 
+// 结合导线的手动折点、分支起点和端口位置，生成当前需要显示的完整折线路径。
 std::vector<POINT> route_wire(Circuit const& circuit, Wire const& wire) {
     auto const* source = find_component(circuit, wire.source);
     auto const* target = find_component(circuit, wire.target);
@@ -318,6 +348,7 @@ std::vector<POINT> route_wire(Circuit const& circuit, Wire const& wire) {
     return route_points(circuit, *source, target, wire.port, wire.bends, nullptr, nullptr, wire.sourcePort);
 }
 
+// 删除导线时同时处理依附于它的分支，避免留下指向不存在父导线的引用。
 void remove_wires(Circuit& circuit, std::set<int> ids) {
     bool changed;
     do {
@@ -334,7 +365,7 @@ void set_component_direction(Circuit& circuit, int componentId, int direction) {
     Component* component = find_component(circuit, componentId);
     if (!component || component->direction == direction) return;
     component->direction = direction;
-    // Absolute bend positions describe the old orientation; reroute both attached ends.
+    // 折点是旧朝向下的绝对位置；旋转后需要重新规划两端相连的导线。
     std::set<int> reroute;
     for (auto const& wire : circuit.wires)
         if (wire.source == componentId || wire.target == componentId) reroute.insert(wire.id);
@@ -373,6 +404,7 @@ bool wire_value(SignalValues const& values, Wire const& wire) {
     return found != values.end() && found->second[wire.sourcePort == -2 ? 1 : 0];
 }
 
+// 组合逻辑求值：以输入电平和已保存的触发器状态为起点，迭代传播；此函数本身不推进触发器状态。
 SignalValues signals(Circuit const& circuit) {
     SignalValues values;
     for (auto const& c : circuit.components) values[c.id] = {(is_source(c.kind) || sequential(c.kind)) && c.value, sequential(c.kind) && !c.value};
@@ -406,22 +438,24 @@ SignalValues signals(Circuit const& circuit) {
     return values;
 }
 
+// 推进时序状态：D 在上升沿采样，SET/CLR 高有效且 CLR 优先；RS 为高电平有效、复位优先。迭代次数有上限，并非传播延迟仿真。
 void advance_simulation(Circuit& circuit) {
-    // Sample all state elements from the same settled snapshot on each event.
+    // 每轮所有状态元件读取同一份已传播快照，保证级联触发器在同一时钟沿采样旧状态。
     for (size_t pass = 0; pass <= circuit.components.size(); ++pass) {
         auto values = signals(circuit);
         bool changed = false;
         for (auto& c : circuit.components) {
             if (!sequential(c.kind)) continue;
-            bool in[3]{};
+            bool in[4]{};
             for (auto const& w : circuit.wires)
-                if (w.target == c.id && w.port >= 0 && w.port < 3) in[w.port] = wire_value(values,w);
+                if (w.target == c.id && w.port >= 0 && w.port < 4) in[w.port] = wire_value(values,w);
             bool next = c.value;
             if (c.kind == RSLatch) {
-                if (in[1]) next = false; // Explicit reset priority.
+                if (in[1]) next = false; // 明确规定复位优先。
                 else if (in[0]) next = true;
             } else {
                 if (in[2]) next = false;
+                else if (in[3]) next = true; // 异步置位不依赖时钟；CLR 同时有效时仍优先。
                 else if (in[1] && !c.lastClock) next = in[0];
                 c.lastClock = in[1];
             }
@@ -432,11 +466,12 @@ void advance_simulation(Circuit& circuit) {
     }
 }
 
+// 统一的逻辑引脚标注：用于画布和 KiCad 逻辑原理图，不能直接当作实际芯片的物理焊盘编号。
 std::string logical_pin_name(Component const& c, int index) {
     if (sequential(c.kind)) {
         if (index < 0) return index == -1 ? "Q" : "~Q";
         if (c.kind == RSLatch) return index == 0 ? "S" : "R";
-        return index == 0 ? "D" : index == 1 ? "CLK" : "R";
+        return index == 0 ? "D" : index == 1 ? "CLK" : index == 2 ? "CLR" : "SET";
     }
     if (index >= 0) return "A" + std::to_string(index + 1);
     if (c.kind == HalfAdder) return index == -1 ? "S" : "C";
@@ -444,6 +479,7 @@ std::string logical_pin_name(Component const& c, int index) {
     return "Y";
 }
 
+// 本程序所需的轻量 JSON 数据模型；类型转换严格检查，损坏或不匹配的数据通过异常报告。
 struct Json {
     enum Type { Object, Array, String, Number, Boolean, Null } type = Null;
     std::map<std::string, Json> object;
@@ -470,6 +506,7 @@ struct Json {
     }
 };
 
+// 解析本程序工程文件中的 JSON；不依赖额外源文件或第三方 JSON 库。
 class JsonParser {
     std::string const& text_;
     size_t position_ = 0;
@@ -552,6 +589,7 @@ public:
     }
 };
 
+// 通过 Unicode Windows 文件接口读写，支持中文路径；读取时限制文件大小，避免加载异常大文件。
 bool read_file(std::wstring const& path, std::string& result) {
     HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                               FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -578,6 +616,7 @@ bool write_file(std::wstring const& path, std::string const& text) {
     return ok;
 }
 
+// 原生 JSON 保存：记录元件、连接、折点和分支，同时保存 Q 与时钟历史，避免重新打开后误产生上升沿。
 std::string serialize(Circuit const& circuit) {
     std::ostringstream out;
     out << "{\n  \"format\": \"mini-logisim-1\",\n  \"components\": [\n";
@@ -633,6 +672,7 @@ POINT gate_point(POINT center, int direction, int forward, int across) {
               center.y + forward * dy + across * dx);
 }
 
+// 导出 .circ 并嵌入本程序的完整 JSON 以支持无损重读；新增时序元件依赖该元数据，不保证第三方 Logisim 能完整还原。
 std::string serialize_circ(Circuit const& circuit) {
     std::ostringstream out;
     out << "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n"
@@ -723,7 +763,7 @@ std::string serialize_circ(Circuit const& circuit) {
     return out.str();
 }
 
-// KiCad schematic export is self-contained for single-file builds.
+// KiCad 导出辅助函数；所有实现保留在当前文件，便于单独复制编译。
 std::string kicad_quote(std::string const& text) {
     std::string result = "\"";
     for (char c : text) {
@@ -745,11 +785,13 @@ std::string kicad_uuid() {
     return result;
 }
 
-// Physical 5V 74HCT implementation, kept here for single-file builds.
+// 实际硬件合成：使用 5V 74HCT 系列，应用实现仍保持单文件。
+// 实际硬件元件：ref 为 PCB 位号，footprint 为 KiCad 库封装，pins 将物理焊盘编号映射到网络名称。
 struct PcbPart {
     std::string ref, value, footprint;
     std::map<int, std::string> pins;
 };
+// 硬件合成辅助模型：分配芯片中的门、生成中间网络，并为芯片添加供电和去耦。
 struct PcbCircuit {
     std::vector<PcbPart> parts;
     std::map<std::string, int> counters;
@@ -760,11 +802,13 @@ struct PcbCircuit {
         parts.push_back({ref, value, footprint, pins});
         return static_cast<int>(parts.size()) - 1;
     }
+    // 芯片采用 SOIC-14，7 脚接地、14 脚供电；每颗芯片配一只 100 nF 去耦电容。
     int chip(std::string value) {
         int index = add("U", value, "Package_SO:SOIC-14_3.9x8.7mm_P1.27mm", {{7,"GND"},{14,"+5V"}});
         add("C", "100n", "Capacitor_SMD:C_0805_2012Metric", {{1,"+5V"},{2,"GND"}});
         return index;
     }
+    // 按 74HCT00 的四组物理引脚顺序分配与非门；forced 用于 RS 反馈输出的预先命名。
     std::string nand_gate(std::string a, std::string b, std::string forced = "") {
         static int const pins[4][3] = {{1,2,3},{4,5,6},{9,10,8},{12,13,11}};
         if (nandSlot == 4) { nandChip = chip("74HCT00D"); nandSlot = 0; }
@@ -779,10 +823,12 @@ struct PcbCircuit {
     std::string or_gate(std::string a, std::string b) {
         auto x = invert(a), y = invert(b); return nand_gate(x,y);
     }
+    // 用四个与非门实现异或；目前不跨逻辑块消除重复的中间运算。
     std::string xor_gate(std::string a, std::string b) {
         auto t = nand_gate(a,b), x = nand_gate(a,t), y = nand_gate(b,t);
         return nand_gate(x,y);
     }
+    // 将非门分配到 74HCT14 的六个施密特反相器中，保持逻辑反相功能及真实引脚映射。
     std::string schmitt(std::string a) {
         static int const pins[6][2] = {{1,2},{3,4},{5,6},{9,8},{11,10},{13,12}};
         if (invSlot == 6) { invChip = chip("74HCT14D"); invSlot = 0; }
@@ -791,6 +837,7 @@ struct PcbCircuit {
         parts[invChip].pins[p[0]] = a; parts[invChip].pins[p[1]] = net;
         return net;
     }
+    // 收尾处理 74HCT00/14 的未用门：输入接地，输出各用独立未连接网络；74HCT74 的未用半片在分配时处理。
     void finish() {
         for (auto& p : parts) {
             if (p.value != "74HCT00D" && p.value != "74HCT14D") continue;
@@ -802,6 +849,7 @@ struct PcbCircuit {
         }
     }
 };
+// 把画布逻辑转换为真实硬件：检查连接、分配信号接口和状态输出，再按依赖生成门电路。允许状态反馈，拒绝无法解析的组合环路。
 PcbCircuit build_pcb_circuit(Circuit const& circuit) {
     using Key = std::pair<int,int>;
     std::map<int, Component const*> components;
@@ -845,7 +893,7 @@ PcbCircuit build_pcb_circuit(Circuit const& circuit) {
                 if (c.kind == DFlipFlop) {
                     int index = pcb.chip("74HCT74D");
                     flipChips[c.id] = index;
-                    // First half used; second half held in reset with all inputs defined.
+                    // 使用第一组 D 触发器；第二组固定复位，并为其全部输入指定电平。
                     pcb.parts[index].pins.insert({{4,"+5V"},{5,outputs[{c.id,-1}]},{6,outputs[{c.id,-2}]},
                         {10,"+5V"},{11,"GND"},{12,"GND"},{13,"GND"}});
                     pcb.parts[index].pins[8] = "unconnected-(" + pcb.parts[index].ref + "-Pad8)";
@@ -871,12 +919,14 @@ PcbCircuit build_pcb_circuit(Circuit const& circuit) {
             else if (c.kind == Not) result = pcb.schmitt(result);
             else if (c.kind == DFlipFlop) {
                 auto clear = pcb.invert(ins[2]);
+                // 74HCT74 的异步端低有效；CLR 抑制 SET，避免同时拉低 PRE/CLR。
+                auto preset = pcb.nand_gate(ins[3],clear);
                 auto& p = pcb.parts[flipChips.at(c.id)];
-                p.pins[1] = clear; p.pins[2] = ins[0]; p.pins[3] = ins[1];
+                p.pins[1] = clear; p.pins[2] = ins[0]; p.pins[3] = ins[1]; p.pins[4] = preset;
                 result = outputs.at({c.id,-1});
             } else if (c.kind == RSLatch) {
                 auto nr = pcb.invert(ins[1]);
-                auto ns = pcb.nand_gate(ins[0],nr); // S is inhibited while R is high.
+                auto ns = pcb.nand_gate(ins[0],nr); // R 为高时抑制 S，使硬件与仿真的复位优先规则一致。
                 result = outputs.at({c.id,-1});
                 auto qb = outputs.at({c.id,-2});
                 pcb.nand_gate(ns,qb,result);
@@ -900,6 +950,7 @@ PcbCircuit build_pcb_circuit(Circuit const& circuit) {
     pcb.finish();
     return pcb;
 }
+// 输出 KiCad version E 硬件网表：包含真实器件、标准库封装、物理引脚及连接，不是抽象逻辑符号清单。
 std::string serialize_kicad_net(Circuit const& circuit) {
     auto pcb = build_pcb_circuit(circuit);
     auto pin_info = [](PcbPart const& p, int n) -> std::pair<std::string,std::string> {
@@ -965,8 +1016,9 @@ std::string serialize_kicad_net(Circuit const& circuit) {
 }
 
 
+// 输出可编辑的 KiCad 逻辑原理图，内嵌符号定义；它不等同于硬件网表，不能直接用于更新已导入硬件的 PCB。
 std::string serialize_kicad(Circuit const& circuit, std::string const& project) {
-    constexpr double scale = 0.127; // One 20-pixel grid step is 100 mil (2.54 mm).
+    constexpr double scale = 0.127; // 画布上一个 20 像素网格对应 100 mil，即 2.54 mm。
     using Net = std::pair<int, int>;
     using XY = std::pair<int, int>;
     struct Segment { POINT a, b; Net net; };
@@ -992,7 +1044,7 @@ std::string serialize_kicad(Circuit const& circuit, std::string const& project) 
         Net net{w.source, w.sourcePort};
         auto route = route_wire(circuit, w);
         if (route.size() < 2) { labeled.insert(net); continue; }
-        // Remove grid-step vertices: an unrelated crossing must not become a junction.
+        // 去掉寻路产生的中间网格顶点，避免无关交叉点被 KiCad 识别为电气连接。
         POINT start = route.front(), previous = start;
         for (size_t i = 1; i < route.size(); ++i) {
             POINT next = route[i];
@@ -1011,8 +1063,8 @@ std::string serialize_kicad(Circuit const& circuit, std::string const& project) 
             p.x >= std::min(s.a.x, s.b.x) && p.x <= std::max(s.a.x, s.b.x) &&
             p.y >= std::min(s.a.y, s.b.y) && p.y <= std::max(s.a.y, s.b.y);
     };
-    // KiCad connects touching endpoints and overlapping wires. Use named nets for
-    // conflicting routes rather than changing the source circuit's connectivity.
+    // KiCad 会连接相触端点和重叠导线；对存在冲突的路径改用同名网络标签，
+    // 以保留原电路的连接关系，避免因几何位置产生误短接。
     for (size_t i = 0; i < segments.size(); ++i) {
         auto const& a = segments[i];
         for (auto const& pin : pins)
@@ -1036,7 +1088,7 @@ std::string serialize_kicad(Circuit const& circuit, std::string const& project) 
             if (on_segment(cross, a) && on_segment(cross, b)) nodes[a.net].insert({cross.x, cross.y});
         }
     }
-    // A same-net junction on a foreign crossing would short the foreign net too.
+    // 即使结点属于同一网络，放在另一网络的交叉线上也会误短接，因此还需检查交叉位置。
     for (auto const& s : segments) for (auto const& group : nodes) {
         if (s.net == group.first) continue;
         for (auto const& p : group.second)
@@ -1078,7 +1130,7 @@ std::string serialize_kicad(Circuit const& circuit, std::string const& project) 
             << "      (property \"Reference\" \"U\" (at 0 " << h + 2.54 << " 0) (effects (font (size 1.27 1.27))))\n"
             << "      (property \"Value\" \"" << symbol << "\" (at 0 " << -h - 2.54 << " 0) (effects (font (size 1.27 1.27))))\n"
             << "      (symbol \"" << symbol << "_0_1\"\n"
-            << "        (rectangle (start -2.54 " << h << ") (end 2.54 " << -h
+            << "        (rectangle (start " << (sequential(c.kind) ? -7.62 : -2.54) << " " << h << ") (end " << (sequential(c.kind) ? 7.62 : 2.54) << " " << -h
             << ") (stroke (width 0.254) (type default)) (fill (type background)))\n"
             << "        (text \"" << captions[c.kind] << "\" (at 0 0 0) (effects (font (size 1.016 1.016))))\n      )\n"
             << "      (symbol \"" << symbol << "_1_1\"\n";
@@ -1087,8 +1139,8 @@ std::string serialize_kicad(Circuit const& circuit, std::string const& project) 
             auto const& p = localPins[i];
             bool output = p.index < 0;
             out << "        (pin " << (output ? "output" : "input") << ' '
-                << (output && inverted_gate(c.kind) ? "inverted" : "line")
-                << " (at " << p.point.x * scale << ' ' << -p.point.y * scale << ' ' << (output ? 180 : 0)
+                << (c.kind == DFlipFlop && p.index == 1 ? "clock" : output && inverted_gate(c.kind) ? "inverted" : "line")
+                << " (at " << p.point.x * scale << ' ' << -p.point.y * scale << ' ' << (c.kind == DFlipFlop && p.index == 2 ? 90 : c.kind == DFlipFlop && p.index == 3 ? 270 : output ? 180 : 0)
                 << ") (length 2.54) (name \"" << pin_name(c, p.index) << "\" (effects (font (size 0.762 0.762))))"
                 << " (number \"" << i + 1 << "\" (effects (font (size 0.762 0.762)))))\n";
         }
@@ -1145,6 +1197,7 @@ std::string serialize_kicad(Circuit const& circuit, std::string const& project) 
     return out.str();
 }
 
+// 加载原生工程并校验元件和连接；兼容旧文件缺少 lastClock 的情况，保留新文件的时钟历史。
 Circuit deserialize(std::string const& text) {
     Json root = JsonParser(text).parse();
     if (root.get("format").as_string() != "mini-logisim-1") throw std::runtime_error("wrong circuit format");
@@ -1226,6 +1279,7 @@ Circuit deserialize(std::string const& text) {
     return result;
 }
 
+// 从本程序写入的 .circ 元数据中恢复完整工程；这里不是通用 Logisim 文件导入器。
 Circuit deserialize_circ(std::string const& text) {
     std::string const marker = "<!-- mini-logisim-json:";
     size_t begin = text.find(marker);
@@ -1252,45 +1306,94 @@ enum CommandId {
     ToolBase = 200, CountEdit = 220, DirectionCombo = 221, RotateButton = 222, LibraryTree = 223
 };
 
+// 波形每 100 ms 连续采样稳定电平；横轴为采样时间，不模拟芯片传播延迟。
+// 拓扑改变后重新开始，移动/缩放不额外采样；最多保留最近 256 个采样点，记录不写入工程文件。
+struct WaveHistory {
+    std::string topology;
+    std::vector<std::wstring> labels;
+    std::vector<std::vector<bool>> samples;
+    size_t firstStep=0;
+    void capture(Circuit const& circuit, bool force=false, bool recordChanges=true) {
+        std::ostringstream key;
+        for(auto const& c:circuit.components) key<<c.id<<':'<<c.kind<<':'<<input_count(c)<<';';
+        for(auto const& w:circuit.wires) key<<w.source<<':'<<w.sourcePort<<'>'<<w.target<<':'<<w.port<<';';
+        if(topology!=key.str()){topology=key.str();samples.clear();firstStep=0;}
+        labels.clear();std::vector<bool> sample;auto values=signals(circuit);
+        for(auto const& c:circuit.components) for(auto const& port:ports(c)) {
+            std::wstring pin;
+            if(c.kind==DFlipFlop) pin=port.index==-1?L"Q":port.index==-2?L"~Q":port.index==0?L"D":port.index==1?L"CLK":port.index==2?L"CLR":L"SET";
+            else if(c.kind==RSLatch) pin=port.index==-1?L"Q":port.index==-2?L"~Q":port.index==0?L"S":L"R";
+            else pin=port.index<0?L"OUT"+std::to_wstring(-port.index):L"IN"+std::to_wstring(port.index+1);
+            labels.push_back(L"U"+std::to_wstring(c.id)+L"."+pin);
+            bool value=false;
+            if(port.index<0)value=values.at(c.id)[port.index==-2?1:0];
+            else for(auto const& w:circuit.wires)if(w.target==c.id && w.port==port.index)value=wire_value(values,w);
+            sample.push_back(value);
+        }
+        if(!sample.empty() && (force || samples.empty() || (recordChanges && sample!=samples.back())))samples.push_back(sample);
+        if(samples.size()>256){samples.erase(samples.begin());++firstStep;}
+    }
+};
+
+// 应用控制器：管理窗口、工具、选择状态、撤销快照、文件操作及画布交互。
 class App {
 public:
     struct UndoState {
         Circuit circuit;
         std::set<int> selectedComponents, selectedWires;
     };
-    HWND mainWindow = nullptr, canvas = nullptr, status = nullptr, selectionLabel = nullptr;
-    HWND libraryTitle = nullptr, libraryTree = nullptr;
-    HWND propertyTitle = nullptr, inputCountLabel = nullptr, directionLabel = nullptr;
-    HWND tipsTitle = nullptr, tipsText = nullptr;
+    HWND mainWindow = nullptr, canvas = nullptr, selectionLabel = nullptr;
+    HWND libraryTree = nullptr;
+
+
     HWND countEdit = nullptr, countMinus = nullptr, countPlus = nullptr;
     HWND directionCombo = nullptr, rotateButton = nullptr;
-    HWND toolButtons[7]{}, tooltips = nullptr;
+    wxBitmapToggleButton* toolButtons[7]{};
     HFONT uiFont = nullptr, gateFont = nullptr;
-    HBRUSH menuBrush = nullptr, toolbarBrush = nullptr;
+
     Circuit circuit;
     std::vector<UndoState> undoHistory;
     std::wstring path;
-    std::wstring menuTipText, menuPreviousStatus;
+
     Tool tool = SelectTool;
     std::set<int> selectedComponents, selectedWires;
     bool updatingControls = false;
     bool draggingComponent = false, dragged = false, marquee = false, dragUndoRecorded = false;
     POINT press{}, dragOffset{}, dragStartPosition{}, marqueeStart{}, marqueeEnd{}, hover{};
     bool hoverValid = false;
-    bool menuHintActive = false;
+
     int dragComponentId = 0, wireStartId = 0, wireStartPort = -1, branchFromWireId = 0;
     int zoomPercent = 100, viewX = 0, viewY = 0, wheelRemainder = 0;
     POINT branchPoint{};
     std::vector<POINT> bends;
 
-    void create_ui(HINSTANCE instance);
-    void layout();
+    // wxWidgets 管理窗口、控件和事件；HWND 仅供现有 Windows 画布/文件接口使用。
+    wxFrame* frame = nullptr;
+    wxPanel* drawing = nullptr;
+    wxTreeCtrl* tree = nullptr;
+    wxStaticText* selection = nullptr;
+    wxTextCtrl* countBox = nullptr;
+    wxChoice* directions = nullptr;
+    wxTextCtrl* helpText = nullptr;
+    wxPopupWindow* hint = nullptr;
+    wxStaticText* hintLabel = nullptr;
+    wxFont menuFont;
+    wxScrolledWindow* waveform = nullptr;
+    WaveHistory waves;
+    wxTimer* waveTimer = nullptr;
+    void update_waveform(bool force=false);
+    void paint_waveform();
+    Tool libraryDragTool = SelectTool;
+    std::map<int, wxTreeItemId> libraryItems;
+    void create_ui();
+    void show_hint(wxString const& text, wxRect anchor = wxRect());
+
     POINT screen_to_world(POINT point) const;
     void zoom_at(int direction, POINT anchor);
     void zoom_center(int direction);
     bool wheel_zoom(POINT screen, int delta);
-    void refresh() { advance_simulation(circuit); if (canvas) InvalidateRect(canvas, nullptr, FALSE); }
-    void set_status(wchar_t const* message) { if (status) SetWindowTextW(status, message); }
+    void refresh() { advance_simulation(circuit); if (drawing) drawing->Refresh(false); update_waveform(); }
+    void set_status(wchar_t const* message) { if (frame) frame->SetStatusText(message); }
     void update_controls();
     void remember_change();
     void undo();
@@ -1318,225 +1421,268 @@ public:
     void open_file();
     void save_file(bool choosePath);
     void handle_command(int id, int notification);
-    void show_menu_hint(HMENU menu, UINT item, UINT flags);
+
 };
 
 App app;
-constexpr wchar_t MainClass[] = L"MiniLogisimMainCpp";
-constexpr wchar_t CanvasClass[] = L"MiniLogisimCanvasCpp";
-
-HWND make_control(wchar_t const* className, wchar_t const* label, DWORD style, int id, HWND parent) {
-    HWND control = CreateWindowExW(0, className, label, WS_CHILD | WS_VISIBLE | style,
-                                   0, 0, 10, 10, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
-                                   GetModuleHandleW(nullptr), nullptr);
-    SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(app.uiFont), TRUE);
-    return control;
-}
-
-struct MenuLabel {
-    wchar_t const* text;
-    wchar_t const* shortcut;
-    bool onBar;
-    wchar_t const* description;
+wxBitmapBundle toolbar_bitmap(int index);
+class LibraryItem : public wxTreeItemData {
+public:
+    Tool tool;
+    explicit LibraryItem(Tool value) : tool(value) {}
 };
 
-HMENU make_menu() {
-    static MenuLabel const labels[] = {
-        {L"\u6587\u4EF6", L"", true, L"\u65B0\u5EFA\u3001\u6253\u5F00\u548C\u4FDD\u5B58\u7535\u8DEF"},
-        {L"\u7F16\u8F91", L"", true, L"\u64A4\u9500\u3001\u5168\u9009\u3001\u5220\u9664\u6216\u65CB\u8F6C\u9009\u4E2D\u5BF9\u8C61"},
-        {L"\u9879\u76EE", L"", true, L"\u9009\u62E9\u95E8\u7535\u8DEF\u6216\u8F93\u5165\u3001\u8F93\u51FA\u5F15\u811A"},
-        {L"\u6A21\u62DF", L"", true, L"\u5207\u6362\u6216\u91CD\u7F6E\u8F93\u5165\u4FE1\u53F7"},
-        {L"\u5E2E\u52A9", L"", true, L"\u67E5\u770B\u7A97\u53E3\u64CD\u4F5C\u8BF4\u660E"},
-        {L"\u65B0\u5EFA\u7A97\u53E3", L"Ctrl+N", false, L"\u6253\u5F00\u65B0\u7684\u7A7A\u767D\u7535\u8DEF\u7A97\u53E3"},
-        {L"\u6253\u5F00\u2026", L"Ctrl+O", false, L"\u4ECE JSON \u6216\u672C\u7A0B\u5E8F\u4FDD\u5B58\u7684 .circ \u6587\u4EF6\u6253\u5F00\u7535\u8DEF"},
-        {L"\u4FDD\u5B58", L"Ctrl+S", false, L"\u5C06\u5F53\u524D\u7535\u8DEF\u4FDD\u5B58\u5230\u6587\u4EF6"},
-        {L"\u53E6\u5B58\u4E3A\u2026", L"Ctrl+Shift+S", false, L"\u9009\u62E9\u65B0\u6587\u4EF6\u4FDD\u5B58\u7535\u8DEF"},
-        {L"\u9000\u51FA", L"Ctrl+Q", false, L"\u5173\u95ED\u5F53\u524D\u7A97\u53E3"},
-        {L"\u5168\u9009", L"Ctrl+A", false, L"\u9009\u4E2D\u753B\u5E03\u4E0A\u5168\u90E8\u5143\u4EF6\u548C\u5BFC\u7EBF"},
-        {L"\u5220\u9664\u9009\u4E2D\u5BF9\u8C61", L"Delete", false, L"\u5220\u9664\u9009\u4E2D\u5143\u4EF6\u548C\u5BFC\u7EBF"},
-        {L"\u987A\u65F6\u9488\u65CB\u8F6C", L"R", false, L"\u5C06\u9009\u4E2D\u5143\u4EF6\u987A\u65F6\u9488\u65CB\u8F6C 90 \u5EA6"},
-        {L"\u4E0E\u95E8", L"", false, L"\u653E\u7F6E\u4E0E\u95E8\uFF1A\u6240\u6709\u8F93\u5165\u4E3A\u771F\u65F6\u8F93\u51FA\u4E3A\u771F"},
-        {L"\u6216\u95E8", L"", false, L"\u653E\u7F6E\u6216\u95E8\uFF1A\u4EFB\u4E00\u8F93\u5165\u4E3A\u771F\u65F6\u8F93\u51FA\u4E3A\u771F"},
-        {L"\u975E\u95E8", L"", false, L"\u653E\u7F6E\u975E\u95E8\uFF1A\u8F93\u51FA\u4E3A\u8F93\u5165\u7684\u76F8\u53CD\u503C"},
-        {L"\u8F93\u5165\u5F15\u811A", L"", false, L"\u653E\u7F6E\u53EF\u5355\u51FB\u5207\u6362 0/1 \u7684\u8F93\u5165\u5F15\u811A"},
-        {L"\u8F93\u51FA\u5F15\u811A", L"", false, L"\u653E\u7F6E\u663E\u793A\u7535\u8DEF\u7ED3\u679C\u7684\u8F93\u51FA\u5F15\u811A"},
-        {L"\u5207\u6362\u9009\u4E2D\u8F93\u5165\u5F15\u811A", L"", false, L"\u5207\u6362\u9009\u4E2D\u8F93\u5165\u5F15\u811A\u7684 0/1 \u72B6\u6001"},
-        {L"\u6240\u6709\u8F93\u5165\u8BBE\u4E3A 0", L"", false, L"\u91CD\u7F6E\u5168\u90E8\u8F93\u5165\u5F15\u811A\u4E3A 0"},
-        {L"\u4F7F\u7528\u8BF4\u660E", L"", false, L"\u67E5\u770B\u9009\u62E9\u3001\u8FDE\u7EBF\u548C\u6A21\u62DF\u7684\u64CD\u4F5C\u8BF4\u660E"},
-        {L"\u64A4\u9500", L"Ctrl+Z", false, L"\u8FD8\u539F\u4E0A\u4E00\u6B21\u7535\u8DEF\u4FEE\u6539"}
-    };
-    auto add = [&](HMENU menu, UINT flags, UINT_PTR id, int label) {
-        AppendMenuW(menu, flags | MF_OWNERDRAW, id,
-                    reinterpret_cast<LPCWSTR>(&labels[label]));
-    };
-    HMENU bar = CreateMenu();
-    HMENU file = CreatePopupMenu();
-    add(file, 0, FileNew, 5);
-    add(file, 0, FileOpen, 6);
-    add(file, 0, FileSave, 7);
-    add(file, 0, FileSaveAs, 8);
-    AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
-    add(file, 0, FileExit, 9);
-    add(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(file), 0);
-    HMENU edit = CreatePopupMenu();
-    add(edit, 0, EditUndo, 21);
-    add(edit, 0, EditSelectAll, 10);
-    add(edit, 0, EditDelete, 11);
-    add(edit, 0, EditRotate, 12);
-    add(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(edit), 1);
-    HMENU project = CreatePopupMenu();
-    for (int i = AndTool; i <= OutputTool; ++i)
-        add(project, 0, ToolBase + i, 13 + i - AndTool);
-    add(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(project), 2);
-    HMENU simulation = CreatePopupMenu();
-    add(simulation, 0, SimToggle, 18);
-    add(simulation, 0, SimReset, 19);
-    add(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(simulation), 3);
-    HMENU help = CreatePopupMenu();
-    add(help, 0, HelpAbout, 20);
-    add(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(help), 4);
-    MENUINFO info{};
-    info.cbSize = sizeof(info);
-    info.fMask = MIM_BACKGROUND;
-    info.hbrBack = app.menuBrush;
-    SetMenuInfo(bar, &info);
-    return bar;
-}
-
-void App::create_ui(HINSTANCE instance) {
-    menuBrush = CreateSolidBrush(MenuSurface);
-    toolbarBrush = CreateSolidBrush(ToolbarSurface);
-    uiFont = CreateFontW(-26, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                         DEFAULT_PITCH, L"Microsoft YaHei UI");
-    gateFont = CreateFontW(-31, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                           DEFAULT_PITCH, L"Segoe UI Symbol");
-    SetMenu(mainWindow, make_menu());
-    DWORD rounded = 2; DwmSetWindowAttribute(mainWindow, 33, &rounded, sizeof(rounded));
-    wchar_t const* labels[7] = {L"\u9009\u62E9", L"\u8FDE\u7EBF", L"\u4E0E\u95E8", L"\u6216\u95E8", L"\u975E\u95E8", L"\u8F93\u5165\u5F15\u811A", L"\u8F93\u51FA\u5F15\u811A"};
-    tooltips = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
-                                WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
-                                CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
-                                mainWindow, nullptr, instance, nullptr);
-    SendMessageW(tooltips, WM_SETFONT, reinterpret_cast<WPARAM>(uiFont), TRUE);
-    SendMessageW(tooltips, TTM_SETMAXTIPWIDTH, 0, 420);
-    auto add_tooltip = [&](HWND control, wchar_t const* description) {
-        TOOLINFOW tip{};
-        tip.cbSize = TTTOOLINFOW_V2_SIZE;
-        tip.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
-        tip.hwnd = mainWindow;
-        tip.uId = reinterpret_cast<UINT_PTR>(control);
-        tip.lpszText = const_cast<LPWSTR>(description);
-        SendMessageW(tooltips, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tip));
-    };
-    TOOLINFOW menuTip{};
-    menuTip.cbSize = TTTOOLINFOW_V2_SIZE;
-    menuTip.uFlags = TTF_TRACK | TTF_ABSOLUTE;
-    menuTip.hwnd = mainWindow;
-    menuTip.uId = 1;
-    menuTip.lpszText = const_cast<LPWSTR>(L"");
-    SendMessageW(tooltips, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&menuTip));
-    wchar_t const* descriptions[7] = {
-        L"\u9009\u62E9\uFF1A\u79FB\u52A8\u5143\u4EF6\u3001\u9009\u4E2D\u5BFC\u7EBF\uFF0C\u6216\u4ECE\u7A7A\u767D\u5904\u62D6\u52A8\u6846\u9009",
-        L"\u8FDE\u7EBF\uFF1A\u4ECE\u8F93\u51FA\u7AEF\u6216\u5DF2\u6709\u5BFC\u7EBF\u5F00\u59CB\uFF0C\u5355\u51FB\u8F93\u5165\u7AEF\u5B8C\u6210\u8FDE\u63A5",
-        L"\u4E0E\u95E8\uFF1A\u653E\u7F6E\u53EF\u8C03\u6574\u8F93\u5165\u6570\u91CF\u7684\u4E0E\u95E8",
-        L"\u6216\u95E8\uFF1A\u653E\u7F6E\u53EF\u8C03\u6574\u8F93\u5165\u6570\u91CF\u7684\u6216\u95E8",
-        L"\u975E\u95E8\uFF1A\u653E\u7F6E\u5C06\u8F93\u5165\u53D6\u53CD\u7684\u975E\u95E8",
-        L"\u8F93\u5165\u5F15\u811A\uFF1A\u653E\u7F6E\u540E\u5355\u51FB\u53EF\u5207\u6362 0/1",
-        L"\u8F93\u51FA\u5F15\u811A\uFF1A\u663E\u793A\u8FDE\u63A5\u5904\u7684\u7535\u8DEF\u7ED3\u679C"
-    };
-    for (int i = 0; i < 7; ++i) {
-        toolButtons[i] = make_control(L"BUTTON", labels[i], BS_OWNERDRAW,
-                                      ToolBase + i, mainWindow);
-        add_tooltip(toolButtons[i], descriptions[i]);
+// 顶部菜单栏位于 Windows 非客户区：这里只桥接悬停通知，窗口及菜单生命周期仍归 wxWidgets。
+class LogisimFrame : public wxFrame {
+public:
+    LogisimFrame() : wxFrame(nullptr,wxID_ANY,L"\u7B80\u6613 Logisim - wxWidgets",wxDefaultPosition,wxSize(1440,900)) {}
+    WXLRESULT MSWWindowProc(WXUINT message, WXWPARAM wParam, WXLPARAM lParam) override {
+        // 只自绘顶层菜单文字，以便独立放大字号；下拉菜单和键盘导航仍由原生菜单处理。
+        if (message == WM_MEASUREITEM && !wParam) {
+            auto* item=reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
+            if(item->CtlType==ODT_MENU && item->itemData>=1 && item->itemData<=6) {
+                wxClientDC dc(this); dc.SetFont(app.menuFont);
+                auto size=dc.GetTextExtent(GetMenuBar()->GetMenuLabelText(item->itemData-1));
+                item->itemWidth=size.x+FromDIP(16); item->itemHeight=size.y+FromDIP(8); return TRUE;
+            }
+        } else if (message == WM_DRAWITEM && !wParam) {
+            auto* item=reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+            if(item->CtlType==ODT_MENU && item->itemData>=1 && item->itemData<=6) {
+                int saved=SaveDC(item->hDC);
+                bool active=(item->itemState&(ODS_SELECTED|ODS_HOTLIGHT))!=0;
+                FillRect(item->hDC,&item->rcItem,GetSysColorBrush(active?COLOR_HIGHLIGHT:COLOR_MENUBAR));
+                                // 原生菜单栏高度受系统度量限制，按实际可用高度收缩字体并保留上下各两像素。
+                LOGFONTW font{};GetObjectW(app.menuFont.GetHFONT(),sizeof(font),&font);
+                font.lfHeight=-std::min(std::abs(font.lfHeight),std::max(1L,item->rcItem.bottom-item->rcItem.top-4));
+                HFONT fitted=CreateFontIndirectW(&font);SelectObject(item->hDC,fitted);SetBkMode(item->hDC,TRANSPARENT);
+                SetTextColor(item->hDC,GetSysColor(active?COLOR_HIGHLIGHTTEXT:COLOR_MENUTEXT));
+                wxString label=GetMenuBar()->GetMenuLabelText(item->itemData-1);
+                RECT rect=item->rcItem; DrawTextW(item->hDC,label.wc_str(),-1,&rect,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+                RestoreDC(item->hDC,saved);DeleteObject(fitted); return TRUE;
+            }
+        }
+        if (message == WM_NCMOUSEMOVE && wParam == HTMENU) {
+            POINT cursor{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};
+            HMENU menu = GetMenu(GetHandle());
+            for (int i=0;i<GetMenuItemCount(menu);++i) {
+                RECT r{};
+                if (GetMenuItemRect(GetHandle(),menu,i,&r) && PtInRect(&r,cursor)) {
+                    static wchar_t const* help[]={L"\u65B0\u5EFA\u3001\u6253\u5F00\u3001\u4FDD\u5B58\u4E0E\u5BFC\u51FA\u7535\u8DEF",L"\u64A4\u9500\u3001\u9009\u62E9\u3001\u5220\u9664\u548C\u65CB\u8F6C",L"\u9009\u62E9\u8981\u653E\u7F6E\u7684\u5143\u4EF6",L"\u5207\u6362\u6216\u590D\u4F4D\u8F93\u5165\u4FE1\u53F7",L"\u653E\u5927\u3001\u7F29\u5C0F\u6216\u590D\u539F\u753B\u5E03",L"\u67E5\u770B\u64CD\u4F5C\u8BF4\u660E"};
+                    if(i<6)app.show_hint(help[i],wxRect(r.left,r.top,r.right-r.left,r.bottom-r.top)); break;
+                }
+            }
+            TRACKMOUSEEVENT track{sizeof(track),TME_LEAVE|TME_NONCLIENT,GetHandle(),0}; TrackMouseEvent(&track);
+        } else if (message == WM_NCMOUSELEAVE) app.show_hint(wxEmptyString);
+        return wxFrame::MSWWindowProc(message,wParam,lParam);
     }
-    libraryTitle = make_control(L"STATIC", L"\u5143\u4EF6\u5E93", SS_LEFT, 0, mainWindow);
-    libraryTree = make_control(WC_TREEVIEWW, L"", WS_TABSTOP |
-                               TVS_HASBUTTONS | TVS_LINESATROOT |
-                               TVS_SHOWSELALWAYS | TVS_INFOTIP, LibraryTree, mainWindow);
-    SendMessageW(libraryTree, TVM_SETITEMHEIGHT, 34, 0);
-    auto insert_library_item = [&](HTREEITEM parent, wchar_t const* text, int toolIndex) {
-        TVINSERTSTRUCTW item{};
-        item.hParent = parent;
-        item.hInsertAfter = TVI_LAST;
-        item.item.mask = TVIF_TEXT | TVIF_PARAM;
-        item.item.pszText = const_cast<LPWSTR>(text);
-        item.item.lParam = toolIndex + 1;
-        return TreeView_InsertItem(libraryTree, &item);
-    };
-    HTREEITEM gates = insert_library_item(TVI_ROOT, L"\u95E8\u7535\u8DEF", -1);
-    for (int index : {AndTool, OrTool, NotTool, XorTool, NandTool, NorTool, XnorTool})
-        insert_library_item(gates, KindNames[index - AndTool], index);
-    HTREEITEM arithmetic = insert_library_item(TVI_ROOT, L"\u8FD0\u7B97\u5668", -1);
-    for (int index : {HalfAdderTool, HalfSubtractorTool, EqualTool})
-        insert_library_item(arithmetic, KindNames[index - AndTool], index);
-    HTREEITEM pins = insert_library_item(TVI_ROOT, L"\u5F15\u811A", -1);
-    for (int index : {InputTool, OutputTool})
-        insert_library_item(pins, KindNames[index - AndTool], index);
-    HTREEITEM storage = insert_library_item(TVI_ROOT, L"\u89E6\u53D1\u5668", -1);
-    for (int index : {DFlipFlopTool, RSLatchTool}) insert_library_item(storage, KindNames[index - AndTool], index);
-    for (int index : {ClockTool, ConstantTool}) insert_library_item(pins, KindNames[index - AndTool], index);
-    SetWindowTheme(libraryTree, L"Explorer", nullptr);
-    TreeView_SetBkColor(libraryTree, RGB(255,255,255));
-    TreeView_SetTextColor(libraryTree, Dark);
-    TreeView_Expand(libraryTree, gates, TVE_EXPAND);
-    propertyTitle = make_control(L"STATIC", L"\u5C5E\u6027", SS_LEFT, 0, mainWindow);
-    selectionLabel = make_control(L"STATIC", L"\u672A\u9009\u4E2D\u5143\u4EF6", SS_LEFT, 0, mainWindow);
-    inputCountLabel = make_control(L"STATIC", L"\u8F93\u5165\u6570", SS_LEFT, 0, mainWindow);
-    countMinus = make_control(L"BUTTON", L"\u2212", BS_PUSHBUTTON, CountMinus, mainWindow);
-    countEdit = make_control(L"EDIT", L"2", WS_BORDER | ES_CENTER | ES_NUMBER, CountEdit, mainWindow);
-    countPlus = make_control(L"BUTTON", L"+", BS_PUSHBUTTON, CountPlus, mainWindow);
-    directionLabel = make_control(L"STATIC", L"\u671D\u5411", SS_LEFT, 0, mainWindow);
-    directionCombo = make_control(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL,
-                                   DirectionCombo, mainWindow);
-    for (auto name : DirectionNames) SendMessageW(directionCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(name));
-    rotateButton = make_control(L"BUTTON", L"\u987A\u65F6\u9488\u65CB\u8F6C  R", BS_PUSHBUTTON, RotateButton, mainWindow);
-    tipsTitle = make_control(L"STATIC", L"\u64CD\u4F5C\u63D0\u793A", SS_LEFT, 0, mainWindow);
-    tipsText = make_control(L"STATIC", L"Ctrl+Z \u64A4\u9500  Ctrl+A \u5168\u9009\r\nDelete \u5220\u9664\r\n\u62D6\u52A8\u6846\u9009  \u8F93\u5165\u5207\u6362\r\n\u5BFC\u7EBF\u5206\u652F  \u7A7A\u767D\u6298\u70B9\r\n\u6EDA\u8F6E\u7F29\u653E  Ctrl+0 \u590D\u539F",
-                            SS_LEFT, 0, mainWindow);
-    status = make_control(L"STATIC", L"\u9009\u62E9\u5DE5\u5177\uFF1B\u5355\u51FB\u8F93\u5165\u5F15\u811A\u53EF\u5207\u6362 0 / 1\u3002",
-                          SS_LEFT | SS_SUNKEN, 0, mainWindow);
-    add_tooltip(countMinus, L"\u51CF\u5C11\u9009\u4E2D\u95E8\u7535\u8DEF\u7684\u8F93\u5165\u5F15\u811A\u6570\u91CF");
-    add_tooltip(countEdit, L"\u8F93\u5165 2 \u81F3 8\uFF0C\u8BBE\u7F6E\u9009\u4E2D\u95E8\u7684\u8F93\u5165\u5F15\u811A\u6570\u91CF");
-    add_tooltip(countPlus, L"\u589E\u52A0\u9009\u4E2D\u95E8\u7535\u8DEF\u7684\u8F93\u5165\u5F15\u811A\u6570\u91CF");
-    add_tooltip(directionCombo, L"\u8BBE\u7F6E\u9009\u4E2D\u95E8\u6216\u5F15\u811A\u7684\u671D\u5411");
-    add_tooltip(rotateButton, L"\u5C06\u9009\u4E2D\u95E8\u6216\u5F15\u811A\u987A\u65F6\u9488\u65CB\u8F6C 90 \u5EA6");
-    canvas = CreateWindowExW(0, CanvasClass, nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                             0, 0, 100, 100, mainWindow, nullptr, instance, nullptr);
-    layout();
-    update_controls();
-    InvalidateRect(toolButtons[0], nullptr, TRUE);
+};
+
+// 提示固定在对应控件或菜单项下沿，不随鼠标位置漂移；屏幕边缘处限制在工作区内。
+void App::show_hint(wxString const& text, wxRect anchor) {
+    if (!hint) return;
+    if (text.empty() || anchor.IsEmpty()) { hint->Hide(); return; }
+    hintLabel->SetLabel(text); hintLabel->Wrap(380); hint->Fit();
+    wxPoint cursor=anchor.GetTopLeft(), pos(anchor.x,anchor.GetBottom()+4);
+    int index=wxDisplay::GetFromPoint(cursor);
+    if (index != wxNOT_FOUND) {
+        wxRect work=wxDisplay(index).GetClientArea(); wxSize size=hint->GetSize();
+        if(pos.y+size.y>work.GetBottom()) pos.y=cursor.y-size.y-8;
+        pos.x=std::max(work.x,std::min(pos.x,work.GetRight()-size.x));
+        pos.y=std::max(work.y,std::min(pos.y,work.GetBottom()-size.y));
+    }
+    hint->Move(pos); hint->Show();
 }
 
-void App::layout() {
-    if (!canvas) return;
-    RECT client{}; GetClientRect(mainWindow, &client);
-    int width = client.right, height = client.bottom;
-    for (int i = 0; i < 7; ++i) MoveWindow(toolButtons[i], 14 + i * 106, 10, 96, 54, TRUE);
-    int right = std::max(SidebarWidth + 120, width - PropertyWidth);
-    MoveWindow(canvas, SidebarWidth, 80, std::max(1, right - SidebarWidth - 12), std::max(1, height - 122), TRUE);
-    MoveWindow(status, 12, height - 38, width - 24, 34, TRUE);
-    MoveWindow(libraryTitle, 20, 90, SidebarWidth - 40, 34, TRUE);
-    MoveWindow(libraryTree, 14, 130, SidebarWidth - 28, std::max(100,height - 184), TRUE);
-    MoveWindow(propertyTitle, right + 16, 90, PropertyWidth - 32, 34, TRUE);
-    MoveWindow(selectionLabel, right + 16, 130, PropertyWidth - 32, 38, TRUE);
-    MoveWindow(inputCountLabel, right + 16, 183, 85, 34, TRUE);
-    MoveWindow(countMinus, right + 105, 178, 36, 40, TRUE);
-    MoveWindow(countEdit, right + 145, 178, 54, 40, TRUE);
-    MoveWindow(countPlus, right + 203, 178, 36, 40, TRUE);
-    MoveWindow(directionLabel, right + 16, 235, 64, 34, TRUE);
-    MoveWindow(directionCombo, right + 86, 230, PropertyWidth - 108, 170, TRUE);
-    MoveWindow(rotateButton, right + 16, 286, PropertyWidth - 32, 44, TRUE);
-    MoveWindow(tipsTitle, right + 16, 350, PropertyWidth - 32, 34, TRUE);
-    MoveWindow(tipsText, right + 16, 394, PropertyWidth - 32, std::max(50,height - 450), TRUE);
+// wxWidgets 原生控件、菜单与 sizer 三栏布局；保留放大字体，元件库占满左侧可用高度。
+void App::create_ui() {
+    frame=new LogisimFrame(); mainWindow=frame->GetHandle();
+    frame->SetMinSize(wxSize(1050,650));
+    frame->SetFont(wxFontInfo(14).FaceName("Microsoft YaHei UI"));
+    uiFont=CreateFontW(-24,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Microsoft YaHei UI");
+    gateFont=CreateFontW(-31,0,0,0,FW_BOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI Symbol");
+    auto* menuBar=new wxMenuBar();
+    auto* file=new wxMenu();
+    file->Append(FileNew,L"\u65B0\u5EFA\u7A97\u53E3\tCtrl+N",L"\u6253\u5F00\u65B0\u7684\u7A7A\u767D\u7535\u8DEF");
+    file->Append(FileOpen,L"\u6253\u5F00\tCtrl+O",L"\u6253\u5F00 JSON \u6216 .circ \u7535\u8DEF");
+    file->Append(FileSave,L"\u4FDD\u5B58\tCtrl+S",L"\u4FDD\u5B58\u5F53\u524D\u7535\u8DEF");
+    file->Append(FileSaveAs,L"\u53E6\u5B58\u4E3A / \u5BFC\u51FA\tCtrl+Shift+S",L"\u4FDD\u5B58\u7535\u8DEF\u6216\u5BFC\u51FA KiCad \u7F51\u8868");
+    file->AppendSeparator(); file->Append(FileExit,L"\u9000\u51FA\tCtrl+Q");
+    menuBar->Append(file,L"\u6587\u4EF6");
+    auto* edit=new wxMenu();
+    edit->Append(EditUndo,L"\u64A4\u9500\tCtrl+Z"); edit->Append(EditSelectAll,L"\u5168\u9009\tCtrl+A");
+    edit->Append(EditDelete,L"\u5220\u9664\tDelete"); edit->Append(EditRotate,L"\u65CB\u8F6C\tR");
+    menuBar->Append(edit,L"\u7F16\u8F91");
+    auto* project=new wxMenu();
+    for(int i=AndTool;i<=ConstantTool;++i) if(i!=RSLatchTool) project->Append(ToolBase+i,KindNames[i-AndTool]);
+    menuBar->Append(project,L"\u5143\u4EF6");
+    auto* simulation=new wxMenu(); simulation->Append(SimToggle,L"\u5207\u6362\u9009\u4E2D\u8F93\u5165"); simulation->Append(SimReset,L"\u6240\u6709\u8F93\u5165\u8BBE\u4E3A 0");
+    menuBar->Append(simulation,L"\u6A21\u62DF");
+    auto* view=new wxMenu(); view->Append(ZoomIn,L"\u653E\u5927\tCtrl++"); view->Append(ZoomOut,L"\u7F29\u5C0F\tCtrl+-"); view->Append(ZoomReset,L"\u590D\u539F\tCtrl+0"); menuBar->Append(view,L"\u89C6\u56FE");
+    auto* help=new wxMenu(); help->Append(HelpAbout,L"\u4F7F\u7528\u8BF4\u660E"); menuBar->Append(help,L"\u5E2E\u52A9"); frame->SetMenuBar(menuBar);
+    // 顶部菜单使用 13 磅字体，不改动系统全局菜单字体设置。
+    menuFont=wxFont(wxFontInfo(13).FaceName("Microsoft YaHei UI"));
+    for(int i=0;i<6;++i) {
+        MENUITEMINFOW info{};info.cbSize=sizeof(info);info.fMask=MIIM_FTYPE|MIIM_DATA;
+        info.fType=MFT_OWNERDRAW;info.dwItemData=i+1;SetMenuItemInfoW(GetMenu(mainWindow),i,TRUE,&info);
+    }
+    DrawMenuBar(mainWindow);
+    frame->CreateStatusBar();
+    hint=new wxPopupWindow(frame,wxBORDER_SIMPLE); hint->SetBackgroundColour(wxSystemSettings::GetColour(wxSYS_COLOUR_INFOBK));
+    hintLabel=new wxStaticText(hint,wxID_ANY,wxEmptyString); auto* hs=new wxBoxSizer(wxVERTICAL); hs->Add(hintLabel,0,wxALL,6); hint->SetSizer(hs);
+    frame->Bind(wxEVT_MENU_HIGHLIGHT,[this](wxMenuEvent& e){
+        auto* item=frame->GetMenuBar()->FindItem(e.GetMenuId()); RECT rect{};
+        HMENU native=item?item->GetMenu()->GetHMenu():nullptr; int position=0;
+        while(native && position<GetMenuItemCount(native) && GetMenuItemID(native,position)!=static_cast<UINT>(e.GetMenuId())) ++position;
+        if(item && GetMenuItemRect(mainWindow,native,position,&rect))
+            show_hint(item->GetHelp().empty()?item->GetItemLabelText():item->GetHelp(),wxRect(rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top));
+        else show_hint(wxEmptyString);
+    });
+    frame->Bind(wxEVT_MENU_CLOSE,[this](wxMenuEvent&){show_hint(wxEmptyString);});
+    frame->Bind(wxEVT_MENU,[this](wxCommandEvent& e){show_hint(wxEmptyString);handle_command(e.GetId(),0);});
+    auto* panel=new wxPanel(frame); auto* vertical=new wxBoxSizer(wxVERTICAL); auto* toolbar=new wxBoxSizer(wxHORIZONTAL);
+    for(int i=0;i<7;++i) {
+        wxString label=i==0?L"\u9009\u62E9":i==1?L"\u8FDE\u7EBF":KindNames[i-AndTool];
+        auto* button=new wxBitmapToggleButton(panel,ToolBase+i,toolbar_bitmap(i),wxDefaultPosition,panel->FromDIP(wxSize(66,42))); toolButtons[i]=button;
+        button->SetName(label);
+        button->Bind(wxEVT_ENTER_WINDOW,[this,button,label](wxMouseEvent& e){show_hint(label,button->GetScreenRect());e.Skip();});
+        button->Bind(wxEVT_LEAVE_WINDOW,[this](wxMouseEvent& e){show_hint(wxEmptyString);e.Skip();});
+         button->SetValue(i==SelectTool); button->Bind(wxEVT_TOGGLEBUTTON,[this,i](wxCommandEvent&){choose_tool(static_cast<Tool>(i));}); toolbar->Add(button,0,wxRIGHT,6);
+    }
+    vertical->Add(toolbar,0,wxEXPAND|wxALL,10); auto* columns=new wxBoxSizer(wxHORIZONTAL);
+    auto* left=new wxBoxSizer(wxVERTICAL); left->Add(new wxStaticText(panel,wxID_ANY,L"\u5143\u4EF6\u5E93"),0,wxBOTTOM,8);
+    tree=new wxTreeCtrl(panel,LibraryTree,wxDefaultPosition,wxSize(280,-1),wxTR_HAS_BUTTONS|wxTR_LINES_AT_ROOT|wxTR_HIDE_ROOT|wxBORDER_SUNKEN);
+    libraryTree=tree->GetHandle(); auto root=tree->AddRoot("root");
+    auto category=[&](wchar_t const* name,std::initializer_list<Tool> tools){auto group=tree->AppendItem(root,name); for(auto t:tools)libraryItems[t]=tree->AppendItem(group,KindNames[t-AndTool],-1,-1,new LibraryItem(t)); return group;};
+    auto gates=category(L"\u95E8\u7535\u8DEF",{AndTool,OrTool,NotTool,XorTool,NandTool,NorTool,XnorTool});
+    category(L"\u8FD0\u7B97\u5668",{HalfAdderTool,HalfSubtractorTool,EqualTool});
+    category(L"\u5F15\u811A",{InputTool,OutputTool,ClockTool,ConstantTool});
+    // RS 不再提供新建入口，但保留旧文件中的 RS 元件、仿真和导出，避免工程丢失。
+    category(L"\u89E6\u53D1\u5668",{DFlipFlopTool}); tree->Expand(gates);
+    tree->Bind(wxEVT_TREE_SEL_CHANGED,[this](wxTreeEvent& e){if(updatingControls)return;auto* data=dynamic_cast<LibraryItem*>(tree->GetItemData(e.GetItem()));if(data)choose_tool(data->tool);});
+    tree->Bind(wxEVT_TREE_ITEM_EXPANDING,[this,root](wxTreeEvent& e){wxTreeItemIdValue cookie;for(auto item=tree->GetFirstChild(root,cookie);item.IsOk();item=tree->GetNextChild(root,cookie))if(item!=e.GetItem())tree->Collapse(item);e.Skip();});
+    // 树控件捕获拖动鼠标；只有在画布客户区内松开才真正创建元件，取消不写入撤销历史。
+    tree->Bind(wxEVT_TREE_BEGIN_DRAG,[this](wxTreeEvent& e){
+        auto* data=dynamic_cast<LibraryItem*>(tree->GetItemData(e.GetItem()));
+        if(!data)return;
+        libraryDragTool=data->tool; show_hint(wxEmptyString);
+        if(!tree->HasCapture())tree->CaptureMouse();
+        tree->SetCursor(wxCursor(wxCURSOR_HAND));
+    });
+    tree->Bind(wxEVT_MOTION,[this](wxMouseEvent& e){
+        if(libraryDragTool==SelectTool){e.Skip();return;}
+        auto point=drawing->ScreenToClient(tree->ClientToScreen(e.GetPosition()));
+        tree->SetCursor(wxCursor(drawing->GetClientRect().Contains(point)?wxCURSOR_CROSS:wxCURSOR_NO_ENTRY));
+    });
+    tree->Bind(wxEVT_LEFT_UP,[this](wxMouseEvent& e){
+        if(libraryDragTool==SelectTool){e.Skip();return;}
+        Tool dropped=libraryDragTool; libraryDragTool=SelectTool;
+        auto point=drawing->ScreenToClient(tree->ClientToScreen(e.GetPosition()));
+        if(tree->HasCapture())tree->ReleaseMouse(); tree->SetCursor(wxNullCursor);
+        if(drawing->GetClientRect().Contains(point)) {
+            choose_tool(dropped);
+            POINT world=screen_to_world(pt(point.x,point.y));canvas_down(world);canvas_up(world);
+        }
+        choose_tool(SelectTool);
+    });
+    tree->Bind(wxEVT_MOUSE_CAPTURE_LOST,[this](wxMouseCaptureLostEvent&){
+        libraryDragTool=SelectTool;tree->SetCursor(wxNullCursor);choose_tool(SelectTool);
+    });
+    frame->Bind(wxEVT_CHAR_HOOK,[this](wxKeyEvent& e){
+        if(e.GetKeyCode()==WXK_ESCAPE && libraryDragTool!=SelectTool) {
+            libraryDragTool=SelectTool;if(tree->HasCapture())tree->ReleaseMouse();
+            tree->SetCursor(wxNullCursor);choose_tool(SelectTool);
+        } else e.Skip();
+    });
+    left->Add(tree,1,wxEXPAND); columns->Add(left,0,wxEXPAND|wxRIGHT,10);
+    drawing=new wxPanel(panel,wxID_ANY,wxDefaultPosition,wxDefaultSize,wxBORDER_SUNKEN|wxWANTS_CHARS); canvas=drawing->GetHandle(); drawing->SetBackgroundStyle(wxBG_STYLE_PAINT);
+    // 波形区位于画布下方，可横向查看采样步、纵向查看全部实际端口。
+    auto* center=new wxBoxSizer(wxVERTICAL);center->Add(drawing,1,wxEXPAND);
+    auto* waveHeader=new wxBoxSizer(wxHORIZONTAL);
+    waveHeader->Add(new wxStaticText(panel,wxID_ANY,L"\u8FDE\u7EED\u6CE2\u5F62\uFF08100 ms\uFF09"),1,wxALIGN_CENTER_VERTICAL);
+    auto* sampleButton=new wxButton(panel,wxID_ANY,L"\u6682\u505C");
+    auto* clearButton=new wxButton(panel,wxID_ANY,L"\u6E05\u7A7A\u6CE2\u5F62");
+    waveHeader->Add(sampleButton,0,wxRIGHT,4);waveHeader->Add(clearButton);
+    center->Add(waveHeader,0,wxEXPAND|wxTOP|wxBOTTOM,4);
+    waveform=new wxScrolledWindow(panel,wxID_ANY,wxDefaultPosition,panel->FromDIP(wxSize(-1,190)),wxBORDER_SUNKEN|wxHSCROLL|wxVSCROLL);
+    waveform->SetBackgroundStyle(wxBG_STYLE_PAINT);waveform->SetScrollRate(20,20);
+    waveform->Bind(wxEVT_PAINT,[this](wxPaintEvent&){paint_waveform();});
+    // 定时采样保持平台连续；暂停只停止记录，不修改电路状态，也不自动翻转手动时钟。
+    waveTimer=new wxTimer(frame);
+    frame->Bind(wxEVT_TIMER,[this](wxTimerEvent&){advance_simulation(circuit);update_waveform(true);},waveTimer->GetId());
+    sampleButton->Bind(wxEVT_BUTTON,[this,sampleButton](wxCommandEvent&){
+        if(waveTimer->IsRunning()){waveTimer->Stop();sampleButton->SetLabel(L"\u7EE7\u7EED");}
+        else {waveTimer->Start(100);sampleButton->SetLabel(L"\u6682\u505C");}
+    });
+    waveTimer->Start(100);
+    clearButton->Bind(wxEVT_BUTTON,[this](wxCommandEvent&){waves=WaveHistory{};waveform->Scroll(0,0);update_waveform();});
+    center->Add(waveform,0,wxEXPAND);columns->Add(center,1,wxEXPAND|wxRIGHT,10);
+    // Windows 版 wxPaintDC 提供 HDC，复用已有双缓冲绘图；鼠标、刷新和窗口销毁由 wxWidgets 分派。
+    drawing->Bind(wxEVT_PAINT,[this](wxPaintEvent&){wxPaintDC dc(drawing);auto size=drawing->GetClientSize();paint_canvas(static_cast<HDC>(dc.GetHDC()),RECT{0,0,size.x,size.y});});
+    drawing->Bind(wxEVT_LEFT_DOWN,[this](wxMouseEvent& e){drawing->SetFocus();canvas_down(screen_to_world(pt(e.GetX(),e.GetY())));});
+    drawing->Bind(wxEVT_MOTION,[this](wxMouseEvent& e){show_hint(wxEmptyString);canvas_move(screen_to_world(pt(e.GetX(),e.GetY())),e.LeftIsDown());});
+    drawing->Bind(wxEVT_LEFT_UP,[this](wxMouseEvent& e){canvas_up(screen_to_world(pt(e.GetX(),e.GetY())));});
+    drawing->Bind(wxEVT_MOUSEWHEEL,[this](wxMouseEvent& e){auto p=drawing->ClientToScreen(e.GetPosition());wheel_zoom(pt(p.x,p.y),e.GetWheelRotation());});
+    auto* right=new wxBoxSizer(wxVERTICAL); right->SetMinSize(wxSize(290,-1));
+    right->Add(new wxStaticText(panel,wxID_ANY,L"\u5C5E\u6027"),0,wxBOTTOM,8);
+    selection=new wxStaticText(panel,wxID_ANY,wxEmptyString);selectionLabel=selection->GetHandle();right->Add(selection,0,wxBOTTOM,14);
+    auto* counts=new wxBoxSizer(wxHORIZONTAL);counts->Add(new wxStaticText(panel,wxID_ANY,L"\u8F93\u5165\u6570"),0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
+    auto* minus=new wxButton(panel,CountMinus,"-",wxDefaultPosition,wxSize(36,-1));countMinus=minus->GetHandle();counts->Add(minus);
+    countBox=new wxTextCtrl(panel,CountEdit,"2",wxDefaultPosition,wxSize(54,-1),wxTE_CENTRE|wxTE_PROCESS_ENTER);countEdit=countBox->GetHandle();counts->Add(countBox,0,wxLEFT|wxRIGHT,4);
+    auto* plus=new wxButton(panel,CountPlus,"+",wxDefaultPosition,wxSize(36,-1));countPlus=plus->GetHandle();counts->Add(plus);right->Add(counts,0,wxBOTTOM,12);
+    minus->Bind(wxEVT_BUTTON,[this](wxCommandEvent&){change_count(-1);});plus->Bind(wxEVT_BUTTON,[this](wxCommandEvent&){change_count(1);});
+    countBox->Bind(wxEVT_TEXT_ENTER,[this](wxCommandEvent&){change_count(0);});countBox->Bind(wxEVT_KILL_FOCUS,[this](wxFocusEvent& e){if(!updatingControls)change_count(0);e.Skip();});
+    wxArrayString names;for(auto n:DirectionNames)names.Add(n);directions=new wxChoice(panel,DirectionCombo,wxDefaultPosition,wxDefaultSize,names);directionCombo=directions->GetHandle();right->Add(directions,0,wxEXPAND|wxBOTTOM,12);
+    directions->Bind(wxEVT_CHOICE,[this](wxCommandEvent&){change_direction();});
+    auto* rotate=new wxButton(panel,RotateButton,L"\u987A\u65F6\u9488\u65CB\u8F6C  R");rotateButton=rotate->GetHandle();right->Add(rotate,0,wxEXPAND|wxBOTTOM,20);rotate->Bind(wxEVT_BUTTON,[this](wxCommandEvent&){rotate_selected();});
+    right->Add(new wxStaticText(panel,wxID_ANY,L"\u5F15\u811A\u8BF4\u660E / \u64CD\u4F5C\u63D0\u793A"),0,wxBOTTOM,8);
+    helpText=new wxTextCtrl(panel,wxID_ANY,wxEmptyString,wxDefaultPosition,wxDefaultSize,wxTE_MULTILINE|wxTE_READONLY|wxTE_WORDWRAP|wxBORDER_NONE);right->Add(helpText,1,wxEXPAND);
+    columns->Add(right,0,wxEXPAND);vertical->Add(columns,1,wxEXPAND|wxLEFT|wxRIGHT|wxBOTTOM,10);panel->SetSizer(vertical);
+    auto* outer=new wxBoxSizer(wxVERTICAL);outer->Add(panel,1,wxEXPAND);frame->SetSizer(outer);
+    frame->Bind(wxEVT_CLOSE_WINDOW,[this](wxCloseEvent&){waveTimer->Stop();delete waveTimer;waveTimer=nullptr;show_hint(wxEmptyString);frame->Destroy();});
+    frame->Centre();update_controls();set_status(L"\u9009\u62E9\u5143\u4EF6\u540E\u5728\u753B\u5E03\u4E0A\u653E\u7F6E\u3002");frame->Show();
 }
 
+// 固定间隔采样，不把鼠标刷新计为时间步。显示区自动跟随最新信号，端口名称固定在左侧。
+void App::update_waveform(bool force) {
+    if(!waveform)return;
+    waves.capture(circuit,force,false);
+    waveform->SetVirtualSize(wxSize(waveform->GetClientSize().x,waveform->FromDIP(50+static_cast<int>(waves.labels.size())*40)));
+    waveform->Refresh(false);
+}
+void App::paint_waveform() {
+    wxAutoBufferedPaintDC dc(waveform);waveform->DoPrepareDC(dc);
+    dc.SetBackground(*wxWHITE_BRUSH);dc.Clear();dc.SetFont(wxFont(wxFontInfo(10)));
+    auto dip=[this](int n){return waveform->FromDIP(n);};
+    dc.SetTextForeground(wxColour(70,70,70));
+    if(waves.labels.empty()){dc.DrawText(L"\u6DFB\u52A0\u5143\u4EF6\u540E\u663E\u793A\u5F15\u811A\u6CE2\u5F62",dip(8),dip(8));return;}
+    // 每段 12 DIP、每十次采样标一秒；超出可见宽度后滚动时间窗口，避免标签随波形移走。
+    size_t capacity=std::max(1,(waveform->GetClientSize().x-dip(150))/dip(12));
+    size_t first=waves.samples.size()>capacity?waves.samples.size()-capacity:0;
+    for(size_t t=first;t<waves.samples.size();++t) {
+        if((waves.firstStep+t)%10)continue;
+        int x=dip(140+static_cast<int>(t-first)*12);dc.SetPen(wxPen(wxColour(230,235,240)));
+        dc.DrawLine(x,0,x,dip(40+static_cast<int>(waves.labels.size())*40));
+        dc.DrawText(wxString::Format("%.1f s",(waves.firstStep+t)*0.1),x,dip(4));
+    }
+    for(size_t row=0;row<waves.labels.size();++row) {
+        int top=36+static_cast<int>(row)*40;
+        dc.SetTextForeground(wxColour(40,50,60));dc.DrawText(waves.labels[row],dip(8),dip(top));
+        dc.SetTextForeground(wxColour(120,120,120));dc.DrawText("1",dip(122),dip(top-5));dc.DrawText("0",dip(122),dip(top+15));
+        dc.SetPen(wxPen(wxColour(22,132,100),dip(2)));
+        for(size_t t=first;t<waves.samples.size();++t) {
+            int x=140+static_cast<int>(t-first)*12,y=top+(waves.samples[t][row]?0:20);
+            if(t>first)dc.DrawLine(dip(x),dip(top+(waves.samples[t-1][row]?0:20)),dip(x),dip(y));
+            dc.DrawLine(dip(x),dip(y),dip(x+12),dip(y));
+        }
+    }
+}
+// 把画布客户区坐标转换为逻辑坐标，消除缩放和平移对命中检测与放置位置的影响。
 POINT App::screen_to_world(POINT point) const {
     return pt(static_cast<int>(std::lround((point.x - viewX) * 100.0 / zoomPercent)),
               static_cast<int>(std::lround((point.y - viewY) * 100.0 / zoomPercent)));
 }
 
+// 以指定屏幕点为缩放锚点，调整平移量，避免鼠标下方的电路在缩放时跳动。
 void App::zoom_at(int direction, POINT anchor) {
     static constexpr int levels[] = {50, 75, 100, 125, 150, 200, 250, 300};
     int next = zoomPercent;
@@ -1582,6 +1728,7 @@ bool App::wheel_zoom(POINT screen, int delta) {
     return true;
 }
 
+// 根据选中元件更新属性栏；只有支持可变输入数的组合门才允许增减输入端口。
 void App::update_controls() {
     if (!selectionLabel) return;
     int count = static_cast<int>(selectedComponents.size() + selectedWires.size());
@@ -1589,18 +1736,25 @@ void App::update_controls() {
     Component const* component = find_component(circuit, single);
     std::wstring label = count > 1 ? L"\u5DF2\u9009\u4E2D " + std::to_wstring(count) + L" \u9879" :
                          component ? KindNames[component->kind] : count == 1 ? L"\u5BFC\u7EBF" : L"\u672A\u9009\u4E2D\u5143\u4EF6";
-    SetWindowTextW(selectionLabel, label.c_str());
+    selection->SetLabel(label);
+    // 选中 D 或准备放置 D 时均显示端口说明；旧工程 RS 仍有明确的引脚说明。
+    Kind kind=component?component->kind:tool>=AndTool?static_cast<Kind>(tool-AndTool):And;
+    helpText->ChangeValue(kind==DFlipFlop ?
+        L"D\uFF1A\u6570\u636E\u8F93\u5165\nCLK\uFF1A\u4E0A\u5347\u6CBF\u91C7\u6837 D\nSET\uFF1A\u9AD8\u7535\u5E73\u5F02\u6B65\u7F6E\u4F4D\nCLR\uFF1A\u9AD8\u7535\u5E73\u5F02\u6B65\u6E05\u96F6\nQ\uFF1A\u5B58\u50A8\u7684\u72B6\u6001\nQ \u4E0A\u6A2A\u7EBF\uFF1A\u53CD\u76F8\u8F93\u51FA\n\nSET=CLR=1 \u65F6 CLR \u4F18\u5148\u3002\n\u672A\u8FDE\u63A5\u8F93\u5165\u6309 0 \u5904\u7406\u3002" : kind==RSLatch ?
+        L"S\uFF1A\u9AD8\u7535\u5E73\u7F6E\u4F4D\nR\uFF1A\u9AD8\u7535\u5E73\u590D\u4F4D\uFF08\u4F18\u5148\uFF09\nQ / \u53CD\u76F8 Q\uFF1A\u4E92\u8865\u8F93\u51FA\n\n\u4EC5\u4E3A\u517C\u5BB9\u65E7\u5DE5\u7A0B\u4FDD\u7559 RS\u3002" :
+        L"Ctrl+Z \u64A4\u9500\nCtrl+A \u5168\u9009\nDelete \u5220\u9664\nR \u65CB\u8F6C\n\u62D6\u52A8\u6846\u9009\n\u5355\u51FB\u8F93\u5165\u5207\u6362 0/1\n\u6EDA\u8F6E\u7F29\u653E\nCtrl+0 \u590D\u539F");
     bool gate = component && adjustable_gate(component->kind);
-    EnableWindow(countEdit, gate); EnableWindow(countMinus, gate); EnableWindow(countPlus, gate);
-    EnableWindow(directionCombo, component != nullptr); EnableWindow(rotateButton, component != nullptr);
+    countBox->Enable(gate); frame->FindWindow(CountMinus)->Enable(gate); frame->FindWindow(CountPlus)->Enable(gate);
+    directions->Enable(component != nullptr); frame->FindWindow(RotateButton)->Enable(component != nullptr);
     if (component) {
         updatingControls = true;
-        SetWindowTextW(countEdit, std::to_wstring(component->inputs).c_str());
-        SendMessageW(directionCombo, CB_SETCURSEL, component->direction, 0);
+        countBox->ChangeValue(std::to_wstring(input_count(*component)));
+        directions->SetSelection(component->direction);
         updatingControls = false;
     }
 }
 
+// 修改前保存电路和选择状态快照，撤销时一并恢复；拖动过程避免为每个鼠标事件重复记录。
 void App::remember_change() {
     undoHistory.push_back({circuit, selectedComponents, selectedWires});
 }
@@ -1620,56 +1774,21 @@ void App::undo() {
     set_status(L"\u5DF2\u64A4\u9500\u4E0A\u4E00\u6B21\u64CD\u4F5C\u3002");
 }
 
-void App::show_menu_hint(HMENU menu, UINT item, UINT flags) {
-    TOOLINFOW tip{};
-    tip.cbSize = TTTOOLINFOW_V2_SIZE;
-    tip.uFlags = TTF_TRACK | TTF_ABSOLUTE;
-    tip.hwnd = mainWindow;
-    tip.uId = 1;
-    if (!menu || item == 0xFFFF || (flags & MF_SEPARATOR)) {
-        SendMessageW(tooltips, TTM_TRACKACTIVATE, FALSE, reinterpret_cast<LPARAM>(&tip));
-        if (menuHintActive) set_status(menuPreviousStatus.c_str());
-        menuHintActive = false;
-        return;
-    }
-    MENUITEMINFOW info{};
-    info.cbSize = sizeof(info);
-    info.fMask = MIIM_DATA;
-    if (!GetMenuItemInfoW(menu, item, (flags & MF_POPUP) != 0, &info)) return;
-    auto const* label = reinterpret_cast<MenuLabel const*>(info.dwItemData);
-    if (!label) return;
-    if (!menuHintActive) {
-        wchar_t previous[256]{};
-        GetWindowTextW(status, previous, 256);
-        menuPreviousStatus = previous;
-        menuHintActive = true;
-    }
-    menuTipText = label->description;
-    tip.lpszText = const_cast<LPWSTR>(menuTipText.c_str());
-    SendMessageW(tooltips, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&tip));
-    POINT cursor{};
-    GetCursorPos(&cursor);
-    SendMessageW(tooltips, TTM_TRACKPOSITION, 0,
-                 MAKELPARAM(std::max<LONG>(0, std::min<LONG>(cursor.x + 300, GetSystemMetrics(SM_CXSCREEN) - 420)),
-                            cursor.y + (label->onBar ? 100 : 12)));
-    SendMessageW(tooltips, TTM_TRACKACTIVATE, TRUE, reinterpret_cast<LPARAM>(&tip));
-    set_status(label->description);
-}
 
 void App::choose_tool(Tool next) {
     tool = next;
-    if (libraryTree) {
-        HTREEITEM selected = TreeView_GetSelection(libraryTree);
-        TVITEMW item{};
-        item.mask = TVIF_PARAM;
-        item.hItem = selected;
-        if (selected && TreeView_GetItem(libraryTree, &item) && item.lParam != next + 1)
-            TreeView_SelectItem(libraryTree, nullptr);
+    if (tree) {
+        updatingControls=true;
+        auto item=libraryItems.find(next);
+        if(item!=libraryItems.end()) tree->SelectItem(item->second); else tree->UnselectAll();
+        updatingControls=false;
     }
+    if (drawing) drawing->SetCursor(wxCursor(next==SelectTool?wxCURSOR_ARROW:wxCURSOR_CROSS));
     wireStartId = branchFromWireId = 0; wireStartPort = -1; bends.clear(); hoverValid = false;
     marquee = draggingComponent = false;
     if (next != SelectTool) clear_selection();
-    for (auto button : toolButtons) InvalidateRect(button, nullptr, TRUE);
+    // 图形工具按钮互斥选中；从菜单或元件库切换工具时也同步按下状态。
+    for (int i=0;i<7;++i) if(toolButtons[i]) toolButtons[i]->SetValue(i==next);
     SetCursor(LoadCursorW(nullptr, next == SelectTool ? IDC_ARROW : IDC_CROSS));
     set_status(next == SelectTool ? L"\u9009\u62E9\u5DE5\u5177\uFF1B\u4ECE\u7A7A\u767D\u5904\u62D6\u52A8\u53EF\u6846\u9009\u3002" :
                next == WireTool ? L"\u5355\u51FB\u8F93\u51FA\u7AEF\u6216\u5DF2\u6709\u5BFC\u7EBF\u5F00\u59CB\uFF0C\u518D\u5355\u51FB\u8F93\u5165\u7AEF\uFF1B\u7A7A\u767D\u5904\u53EF\u6DFB\u52A0\u6298\u70B9\u3002" :
@@ -1740,7 +1859,7 @@ void App::change_direction() {
     if (updatingControls) return;
     Component* component = find_component(circuit, single_component());
     if (!component) return;
-    int direction = static_cast<int>(SendMessageW(directionCombo, CB_GETCURSEL, 0, 0));
+    int direction = directions->GetSelection();
     if (direction >= 0 && direction < 4 && direction != component->direction) {
         remember_change();
         set_component_direction(circuit, component->id, direction);
@@ -1748,6 +1867,7 @@ void App::change_direction() {
     refresh();
 }
 
+// 单击或命令切换输入、手动时钟和逻辑常量；手动时钟的 0 到 1 变化驱动 D 触发器采样。
 void App::toggle_selected() {
     Component* component = find_component(circuit, single_component());
     if (component && is_source(component->kind)) {
@@ -1756,6 +1876,7 @@ void App::toggle_selected() {
     }
 }
 
+// 清零信号源和保存的时序状态，然后重新传播；如果电路连线仍满足置位条件，传播后状态可能再次改变。
 void App::reset_inputs() {
     bool changed = std::any_of(circuit.components.begin(), circuit.components.end(),
         [](Component const& c) { return (is_source(c.kind) || sequential(c.kind)) && (c.value || c.lastClock); });
@@ -1798,6 +1919,7 @@ int App::wire_at(POINT p) {
     return 0;
 }
 
+// 画布按下事件：按当前工具开始放置、连线、选择、框选或拖动；连线记录逻辑端口而非仅记录坐标。
 void App::canvas_down(POINT p) {
     SetFocus(canvas); SetCapture(canvas);
     press = p; dragged = dragUndoRecorded = false;
@@ -1911,6 +2033,7 @@ void App::canvas_move(POINT p, bool leftDown) {
     refresh();
 }
 
+// 结束拖动或框选；未发生拖动的信号源点击按电平切换处理。
 void App::canvas_up(POINT p) {
     if (GetCapture() == canvas) ReleaseCapture();
     if (dragUndoRecorded) {
@@ -1944,11 +2067,12 @@ void draw_line(HDC dc, std::vector<POINT> const& points, COLORREF color, bool da
     SelectObject(dc, previous); DeleteObject(pen);
 }
 
-void draw_shape(HDC dc, RECT bounds, bool ellipse, COLORREF fill, COLORREF border, bool dashed) {
+void draw_shape(HDC dc, RECT bounds, bool ellipse, COLORREF fill, COLORREF border, bool dashed, bool square = false) {
     HBRUSH brush = CreateSolidBrush(fill);
     HPEN pen = CreatePen(dashed ? PS_DASH : PS_SOLID, dashed ? 1 : 2, border);
     HGDIOBJ oldBrush = SelectObject(dc, brush), oldPen = SelectObject(dc, pen);
     if (ellipse) Ellipse(dc, bounds.left, bounds.top, bounds.right, bounds.bottom);
+    else if (square) Rectangle(dc, bounds.left, bounds.top, bounds.right, bounds.bottom);
     else RoundRect(dc, bounds.left, bounds.top, bounds.right, bounds.bottom, 12, 12);
     SelectObject(dc, oldBrush); SelectObject(dc, oldPen);
     DeleteObject(brush); DeleteObject(pen);
@@ -1972,6 +2096,28 @@ int gate_input_edge(Kind kind, int across, int height, int radius) {
 
 void draw_gate_body(HDC dc, Kind kind, POINT center, int direction,
                     int radius, int height, COLORREF fill, COLORREF border, bool selected) {
+    if (sequential(kind)) {
+        // 矩形触发器：文字放在框内，与引线分离；旋转只改变位置，文字保持正向可读。
+        int hx=direction%2?80:60, hy=direction%2?60:80;
+        draw_shape(dc,RECT{center.x-hx,center.y-hy,center.x+hx,center.y+hy},false,fill,border,selected,true);
+        auto label=[&](wchar_t const* text,int x,int y,bool bar=false) {
+            POINT p=gate_point(center,direction,x,y);
+            RECT r{p.x-24,p.y-14,p.x+24,p.y+14};
+            auto old=SelectObject(dc,app.uiFont);SetBkMode(dc,TRANSPARENT);SetTextColor(dc,Dark);
+            DrawTextW(dc,text,-1,&r,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+            if(bar)draw_line(dc,{pt(p.x-9,p.y-14),pt(p.x+9,p.y-14)},Dark,false,2);
+            SelectObject(dc,old);
+        };
+        label(kind==DFlipFlop?L"D":L"S",-38,-40);
+        label(L"Q",38,-40);label(L"Q",38,40,true);
+        if(kind==DFlipFlop) {
+            label(L"SET",0,-60);label(L"CLR",0,60);
+            // 左侧小三角表示 CLK 上升沿触发，不使用容易遮挡引线的外部文字。
+            draw_line(dc,{gate_point(center,direction,-60,10),gate_point(center,direction,-50,20),gate_point(center,direction,-60,30)},Dark,false,2);
+            label(L"CLK",-23,20);
+        } else label(L"R",-38,40);
+        return;
+    }
     if (kind >= HalfAdder) {
         int hx = sequential(kind) && direction % 2 ? height : radius;
         int hy = sequential(kind) && direction % 2 ? radius : height;
@@ -2035,31 +2181,25 @@ void draw_gate_body(HDC dc, Kind kind, POINT center, int direction,
     }
 }
 
-void draw_toolbar_button(DRAWITEMSTRUCT const& item) {
-    int index = static_cast<int>(item.CtlID) - ToolBase;
-    if (index < 0 || index >= 7) return;
-    HDC dc = item.hDC;
-    RECT bounds = item.rcItem;
-    bool selected = app.tool == index;
-    HBRUSH background = CreateSolidBrush(selected ? RGB(220, 237, 255) :
-                                          (item.itemState & ODS_SELECTED) ? RGB(231, 236, 241) : RGB(250, 251, 253));
-    FillRect(dc, &bounds, background);
-    DeleteObject(background);
-    HPEN border = CreatePen(PS_SOLID, selected ? 2 : 1,
-                            selected ? Blue : RGB(170, 181, 191));
-    HGDIOBJ oldPen = SelectObject(dc, border);
-    HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-    RoundRect(dc, bounds.left, bounds.top, bounds.right, bounds.bottom, 12, 12);
-    SelectObject(dc, oldBrush); SelectObject(dc, oldPen); DeleteObject(border);
-    int cx = (bounds.left + bounds.right) / 2;
-    int cy = (bounds.top + bounds.bottom) / 2;
+
+// 按原工具栏绘制箭头、导线、逻辑门和输入/输出图标；位图内嵌生成，不依赖外部图片文件。
+// 图标缩小到 48×30 逻辑像素，提供 1x/2x 位图适配 DPI；透明背景保留原生按钮状态。
+wxBitmapBundle toolbar_bitmap(int index) {
+    auto render=[&](int scale) {
+        wxBitmap bitmap(48*scale,30*scale,24);
+        wxMemoryDC memory(bitmap);
+        wxColour transparent(240,240,240);
+        memory.SetBackground(wxBrush(transparent)); memory.Clear();
+        HDC dc=static_cast<HDC>(memory.GetHDC()); int saved=SaveDC(dc);
+        SetMapMode(dc,MM_ANISOTROPIC);SetWindowExtEx(dc,80,48,nullptr);SetViewportExtEx(dc,48*scale,30*scale,nullptr);
+        int cx=40,cy=24;
     if (index == SelectTool) {
         POINT arrow[] = {pt(cx - 15, cy - 20), pt(cx - 13, cy + 16), pt(cx - 5, cy + 7),
                          pt(cx + 2, cy + 20), pt(cx + 9, cy + 16), pt(cx + 2, cy + 4),
                          pt(cx + 15, cy + 2)};
         HBRUSH brush = CreateSolidBrush(Dark);
         HPEN pen = CreatePen(PS_SOLID, 1, Dark);
-        oldBrush = SelectObject(dc, brush); oldPen = SelectObject(dc, pen);
+        HGDIOBJ oldBrush = SelectObject(dc, brush), oldPen = SelectObject(dc, pen);
         Polygon(dc, arrow, static_cast<int>(sizeof(arrow) / sizeof(arrow[0])));
         SelectObject(dc, oldBrush); SelectObject(dc, oldPen);
         DeleteObject(brush); DeleteObject(pen);
@@ -2084,58 +2224,12 @@ void draw_toolbar_button(DRAWITEMSTRUCT const& item) {
         draw_shape(dc, RECT{cx - 8, cy - 12, cx + 16, cy + 12}, true,
                    RGB(255, 255, 255), Dark, false);
     }
-    if (item.itemState & ODS_FOCUS) {
-        RECT focus = bounds;
-        InflateRect(&focus, -4, -4);
-        DrawFocusRect(dc, &focus);
-    }
-}
 
-void measure_menu_item(MEASUREITEMSTRUCT& item) {
-    auto const* label = reinterpret_cast<MenuLabel const*>(item.itemData);
-    if (!label) return;
-    HDC dc = GetDC(app.mainWindow);
-    HGDIOBJ oldFont = SelectObject(dc, app.uiFont);
-    SIZE text{}, shortcut{};
-    GetTextExtentPoint32W(dc, label->text, lstrlenW(label->text), &text);
-    GetTextExtentPoint32W(dc, label->shortcut, lstrlenW(label->shortcut), &shortcut);
-    TEXTMETRICW metrics{};
-    GetTextMetricsW(dc, &metrics);
-    item.itemWidth = text.cx + (label->onBar ? 28 : 42 + (shortcut.cx ? shortcut.cx + 28 : 0));
-    item.itemHeight = metrics.tmHeight + 12;
-    SelectObject(dc, oldFont);
-    ReleaseDC(app.mainWindow, dc);
-}
-
-void draw_menu_item(DRAWITEMSTRUCT const& item) {
-    auto const* label = reinterpret_cast<MenuLabel const*>(item.itemData);
-    if (!label) return;
-    bool selected = (item.itemState & ODS_SELECTED) != 0;
-    FillRect(item.hDC, &item.rcItem,
-             selected ? GetSysColorBrush(COLOR_HIGHLIGHT) :
-             label->onBar ? app.menuBrush : GetSysColorBrush(COLOR_MENU));
-    HGDIOBJ oldFont = SelectObject(item.hDC, app.uiFont);
-    int oldMode = SetBkMode(item.hDC, TRANSPARENT);
-    COLORREF oldColor = SetTextColor(item.hDC,
-        GetSysColor(item.itemState & ODS_DISABLED ? COLOR_GRAYTEXT :
-                    selected ? COLOR_HIGHLIGHTTEXT : COLOR_MENUTEXT));
-    RECT textRect = item.rcItem;
-    textRect.left += label->onBar ? 14 : 20;
-    textRect.right -= label->onBar ? 14 : 16;
-    if (*label->shortcut) {
-        SIZE size{};
-        GetTextExtentPoint32W(item.hDC, label->shortcut, lstrlenW(label->shortcut), &size);
-        RECT shortcutRect = textRect;
-        shortcutRect.left = shortcutRect.right - size.cx;
-        DrawTextW(item.hDC, label->shortcut, -1, &shortcutRect,
-                  DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_NOPREFIX);
-        textRect.right = shortcutRect.left - 20;
-    }
-    DrawTextW(item.hDC, label->text, -1, &textRect,
-              DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
-    SetTextColor(item.hDC, oldColor);
-    SetBkMode(item.hDC, oldMode);
-    SelectObject(item.hDC, oldFont);
+        RestoreDC(dc,saved);memory.SelectObject(wxNullBitmap);
+        bitmap.SetMask(new wxMask(bitmap,transparent));
+        return bitmap;
+    };
+    return wxBitmapBundle::FromBitmaps(render(1),render(2));
 }
 
 void App::paint_canvas(HDC dc, RECT client) {
@@ -2218,7 +2312,15 @@ void App::paint_canvas(HDC dc, RECT client) {
                     if (wire.target == c.id && wire.port == port.index && wire_value(values, wire)) portValue = true;
             COLORREF color = portValue ? Blue : Dark;
             POINT edge{};
-            if (is_source(c.kind) || c.kind == Output) {
+            if (sequential(c.kind)) {
+                int x=port.index<0?60:-60, y=port.index==-1||port.index==0?-40:40;
+                if(c.kind==DFlipFlop) {
+                    if(port.index==1)y=20;
+                    if(port.index==2){x=0;y=80;}
+                    if(port.index==3){x=0;y=-80;}
+                }
+                edge=gate_point(pt(c.x,c.y),c.direction,x,y);
+            } else if (is_source(c.kind) || c.kind == Output) {
                 int dx = DirectionX[c.direction], dy = DirectionY[c.direction];
                 int sign = port.index == -1 ? -1 : 1;
                 edge = pt(port.point.x + sign * 20 * dx,
@@ -2235,11 +2337,6 @@ void App::paint_canvas(HDC dc, RECT client) {
                                   gate_input_edge(c.kind, across, half_height(c), 23), across);
             }
             draw_line(memory, {edge, port.point}, color, false, 2);
-            if (sequential(c.kind)) {
-                auto name = logical_pin_name(c,port.index); std::wstring text(name.begin(),name.end());
-                RECT r{port.point.x-28,port.point.y-30,port.point.x+40,port.point.y-4};
-                SelectObject(memory,uiFont); SetTextColor(memory,Dark); DrawTextW(memory,text.c_str(),-1,&r,DT_SINGLELINE | DT_LEFT);
-            }
         }
     }
     if (marquee) {
@@ -2284,11 +2381,12 @@ std::string kicad_project_name(std::wstring const& path) {
     return name;
 }
 
+// 保存 KiCad 工程及同名逻辑原理图；已有工程的设置文件保留，只更新对应原理图。
 void save_kicad_project(Circuit const& circuit, std::wstring const& destination) {
     std::string project = kicad_project_name(destination);
     std::string schematic = serialize_kicad(circuit, project);
     std::wstring schematicPath = destination.substr(0, destination.size() - 10) + L".kicad_sch";
-    // Keep settings from an existing KiCad project when updating its schematic.
+    // 更新原理图时保留已有 KiCad 工程设置。
     if (GetFileAttributesW(destination.c_str()) == INVALID_FILE_ATTRIBUTES) {
         std::string settings = "{\n  \"meta\": {\"filename\": " + kicad_quote(project + ".kicad_pro") +
             ", \"version\": 3},\n  \"schematic\": {\"meta\": {\"version\": 1}}\n}\n";
@@ -2297,34 +2395,25 @@ void save_kicad_project(Circuit const& circuit, std::wstring const& destination)
     if (!write_file(schematicPath, schematic)) throw std::runtime_error("Cannot write the companion .kicad_sch file.");
 }
 
+// wxFileDialog 统一打开/另存为入口；导出后仍保留原生工程的当前路径。
 std::wstring choose_file(HWND owner, bool save, DWORD& filterIndex) {
-    wchar_t buffer[MAX_PATH]{};
-    OPENFILENAMEW dialog{};
-    dialog.lStructSize = sizeof(dialog);
-    dialog.hwndOwner = owner;
-    dialog.lpstrFile = buffer;
-    dialog.nMaxFile = MAX_PATH;
-    dialog.lpstrFilter = save ?
-        L"\u7B80\u6613\u7535\u8DEF JSON (*.json)\0*.json\0Logisim \u9879\u76EE (*.circ)\0*.circ\0KiCad \u5DE5\u7A0B (*.kicad_pro)\0*.kicad_pro\0KiCad \u539F\u7406\u56FE (*.kicad_sch)\0*.kicad_sch\0KiCad \u7F51\u8868 (*.net)\0*.net\0\0" :
-        L"\u7B80\u6613\u7535\u8DEF JSON (*.json)\0*.json\0Logisim \u9879\u76EE (*.circ)\0*.circ\0\u6240\u6709\u6587\u4EF6 (*.*)\0*.*\0\0";
-    dialog.nFilterIndex = filterIndex;
-    dialog.Flags = OFN_PATHMUSTEXIST | (save ? OFN_OVERWRITEPROMPT : OFN_FILEMUSTEXIST);
-    if (!(save ? GetSaveFileNameW(&dialog) : GetOpenFileNameW(&dialog))) return {};
-    filterIndex = dialog.nFilterIndex;
-    std::wstring chosen = buffer;
-    if (save) {
-        size_t slash = chosen.find_last_of(L"\\/");
-        size_t dot = chosen.find_last_of(L'.');
-        if (dot == std::wstring::npos || (slash != std::wstring::npos && dot < slash)) {
-            chosen += filterIndex == 5 ? L".net" : filterIndex == 3 ? L".kicad_pro" : filterIndex == 4 ? L".kicad_sch" : filterIndex == 2 ? L".circ" : L".json";
-            if (GetFileAttributesW(chosen.c_str()) != INVALID_FILE_ATTRIBUTES &&
-                MessageBoxW(owner, L"\u6587\u4EF6\u5DF2\u5B58\u5728\uFF0C\u662F\u5426\u8986\u76D6\uFF1F", L"\u786E\u8BA4\u8986\u76D6", MB_YESNO | MB_ICONQUESTION) != IDYES)
-                return {};
+    wxString filters = save ? L"\u7B80\u6613\u7535\u8DEF JSON (*.json)|*.json|Logisim \u9879\u76EE (*.circ)|*.circ|KiCad \u5DE5\u7A0B (*.kicad_pro)|*.kicad_pro|KiCad \u539F\u7406\u56FE (*.kicad_sch)|*.kicad_sch|KiCad \u7F51\u8868 (*.net)|*.net" :
+        L"\u7B80\u6613\u7535\u8DEF JSON (*.json)|*.json|Logisim \u9879\u76EE (*.circ)|*.circ|\u6240\u6709\u6587\u4EF6 (*.*)|*.*";
+    wxFileDialog dialog(app.frame,save?L"\u53E6\u5B58\u4E3A / \u5BFC\u51FA":L"\u6253\u5F00",wxEmptyString,wxEmptyString,filters,
+        save?wxFD_SAVE|wxFD_OVERWRITE_PROMPT:wxFD_OPEN|wxFD_FILE_MUST_EXIST);
+    dialog.SetFilterIndex(static_cast<int>(filterIndex)-1);
+    if(dialog.ShowModal()!=wxID_OK)return {};
+    filterIndex=dialog.GetFilterIndex()+1;
+    std::wstring chosen=dialog.GetPath().ToStdWstring();
+    if(save) {
+        size_t slash=chosen.find_last_of(L"\\/"),dot=chosen.find_last_of(L'.');
+        if(dot==std::wstring::npos || (slash!=std::wstring::npos && dot<slash)) {
+            chosen+=filterIndex==5?L".net":filterIndex==4?L".kicad_sch":filterIndex==3?L".kicad_pro":filterIndex==2?L".circ":L".json";
+            if(wxFileExists(chosen) && wxMessageBox(L"\u6587\u4EF6\u5DF2\u5B58\u5728\uFF0C\u662F\u5426\u8986\u76D6\uFF1F",L"\u786E\u8BA4\u8986\u76D6",wxYES_NO|wxICON_QUESTION,app.frame)!=wxYES)return {};
         }
     }
     return chosen;
 }
-
 void App::new_file() {
     wchar_t executable[MAX_PATH]{};
     if (!GetModuleFileNameW(nullptr, executable, MAX_PATH)) return;
@@ -2358,6 +2447,7 @@ void App::open_file() {
     try {
         Circuit loaded = circ_path(chosen) ? deserialize_circ(text) : deserialize(text);
         circuit = std::move(loaded);
+        waves=WaveHistory{};
         undoHistory.clear();
     } catch (std::exception const&) {
         MessageBoxW(mainWindow, circ_path(chosen) ?
@@ -2366,10 +2456,11 @@ void App::open_file() {
         return;
     }
     path = chosen; clear_selection(); wireStartId = branchFromWireId = 0; wireStartPort = -1; bends.clear(); marquee = false;
-    SetWindowTextW(mainWindow, (L"\u7B80\u6613 Logisim C++ \u2014 " + path).c_str());
+    frame->SetTitle(L"\u7B80\u6613 Logisim - wxWidgets \u2014 " + path);
     update_controls(); refresh();
 }
 
+// 按扩展名分流原生保存与导出；网表提示中的数量和位号来自实际硬件清单，而不是画布符号数量。
 void App::save_file(bool choosePath) {
     std::wstring destination = path;
     if (choosePath || destination.empty()) {
@@ -2415,25 +2506,25 @@ void App::save_file(bool choosePath) {
             MultiByteToWideChar(CP_UTF8, 0, error.what(), -1, &detail[0], length);
             MessageBoxW(mainWindow, (L"\u65E0\u6CD5\u5BFC\u51FA KiCad \u6587\u4EF6\u3002\n" + detail).c_str(), L"\u5BFC\u51FA\u5931\u8D25", MB_OK | MB_ICONERROR);
         }
-        return; // Export does not replace the editable native document path.
+        return; // 导出不替换当前可编辑原生工程的保存路径。
     }
     if (!write_file(destination, circ_path(destination) ? serialize_circ(circuit) : serialize(circuit))) {
         MessageBoxW(mainWindow, L"\u65E0\u6CD5\u5199\u5165\u7535\u8DEF\u6587\u4EF6\u3002", L"\u4FDD\u5B58\u5931\u8D25", MB_OK | MB_ICONERROR);
         return;
     }
     path = destination;
-    SetWindowTextW(mainWindow, (L"\u7B80\u6613 Logisim C++ \u2014 " + path).c_str());
+    frame->SetTitle(L"\u7B80\u6613 Logisim - wxWidgets \u2014 " + path);
     set_status(L"\u5DF2\u4FDD\u5B58\u7535\u8DEF\u3002");
 }
 
 void App::handle_command(int id, int notification) {
-    if (id >= ToolBase && id < ToolBase + 7) { choose_tool(static_cast<Tool>(id - ToolBase)); return; }
+    if (id >= ToolBase && id <= ToolBase + ConstantTool) { choose_tool(static_cast<Tool>(id - ToolBase)); return; }
     switch (id) {
     case FileNew: new_file(); break;
     case FileOpen: open_file(); break;
     case FileSave: save_file(false); break;
     case FileSaveAs: save_file(true); break;
-    case FileExit: DestroyWindow(mainWindow); break;
+    case FileExit: if(frame)frame->Close(); break;
     case EditUndo: undo(); break;
     case EditSelectAll: select_all(); break;
     case EditDelete: delete_selected(); break;
@@ -2464,190 +2555,21 @@ void App::handle_command(int id, int notification) {
     }
 }
 
-LRESULT CALLBACK CanvasProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
-    POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-    switch (message) {
-    case WM_LBUTTONDOWN: app.canvas_down(app.screen_to_world(point)); return 0;
-    case WM_MOUSEMOVE: app.canvas_move(app.screen_to_world(point), (wParam & MK_LBUTTON) != 0); return 0;
-    case WM_LBUTTONUP: app.canvas_up(app.screen_to_world(point)); return 0;
-    case WM_MOUSEWHEEL:
-        if (app.wheel_zoom(point, GET_WHEEL_DELTA_WPARAM(wParam))) return 0;
-        return DefWindowProcW(window, message, wParam, lParam);
-    case WM_SETCURSOR:
-        SetCursor(LoadCursorW(nullptr, app.tool == SelectTool ? IDC_ARROW : IDC_CROSS)); return TRUE;
-    case WM_ERASEBKGND: return 1;
-    case WM_PAINT: {
-        PAINTSTRUCT paint{};
-        HDC dc = BeginPaint(window, &paint);
-        RECT client{}; GetClientRect(window, &client);
-        app.paint_canvas(dc, client);
-        EndPaint(window, &paint);
-        return 0;
+// wxApp 负责初始化、事件循环与退出清理，不再注册 Win32 窗口类或手写消息循环。
+class LogisimApplication : public wxApp {
+public:
+    bool OnInit() override { app.create_ui(); SetTopWindow(app.frame); return true; }
+    int OnExit() override {
+        if(app.uiFont)DeleteObject(app.uiFont);
+        if(app.gateFont)DeleteObject(app.gateFont);
+        return wxApp::OnExit();
     }
-    default: return DefWindowProcW(window, message, wParam, lParam);
-    }
-}
-
-LRESULT CALLBACK MainProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
-    switch (message) {
-    case WM_CREATE:
-        app.mainWindow = window;
-        app.create_ui(reinterpret_cast<LPCREATESTRUCTW>(lParam)->hInstance);
-        return 0;
-    case WM_GETMINMAXINFO: { auto* info = reinterpret_cast<MINMAXINFO*>(lParam); info->ptMinTrackSize = POINT{1000,650}; return 0; }
-    case WM_CTLCOLORSTATIC: SetBkColor(reinterpret_cast<HDC>(wParam), ToolbarSurface); SetTextColor(reinterpret_cast<HDC>(wParam), Dark); return reinterpret_cast<LRESULT>(app.toolbarBrush);
-    case WM_SIZE: app.layout(); return 0;
-    case WM_NCMOUSEMOVE:
-        if (wParam == HTMENU) {
-            POINT cursor{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-            HMENU menu = GetMenu(window);
-            for (int i = 0; i < GetMenuItemCount(menu); ++i) {
-                RECT bounds{};
-                if (GetMenuItemRect(window, menu, i, &bounds) && PtInRect(&bounds, cursor)) {
-                    app.show_menu_hint(menu, i, MF_POPUP);
-                    break;
-                }
-            }
-            TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE | TME_NONCLIENT, window, 0};
-            TrackMouseEvent(&tracking);
-        }
-        return DefWindowProcW(window, message, wParam, lParam);
-    case WM_NCMOUSELEAVE:
-        app.show_menu_hint(nullptr, 0xFFFF, 0);
-        return DefWindowProcW(window, message, wParam, lParam);
-    case WM_ERASEBKGND: {
-        HDC dc = reinterpret_cast<HDC>(wParam);
-        RECT client{}; GetClientRect(window, &client);
-        FillRect(dc, &client, app.toolbarBrush);
-        client.bottom = std::min(client.bottom, 80L);
-        FillRect(dc, &client, app.toolbarBrush);
-        return 1;
-    }
-    case WM_COMMAND:
-        app.handle_command(LOWORD(wParam), HIWORD(wParam));
-        return 0;
-    case WM_MOUSEWHEEL:
-        if (app.wheel_zoom(pt(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)), GET_WHEEL_DELTA_WPARAM(wParam))) return 0;
-        return DefWindowProcW(window, message, wParam, lParam);
-    case WM_NOTIFY: {
-        auto const* notification = reinterpret_cast<NMHDR const*>(lParam);
-        if (notification && notification->hwndFrom == app.libraryTree) {
-            if (notification->code == TVN_ITEMEXPANDINGW) {
-                auto* change = reinterpret_cast<NMTREEVIEWW*>(lParam);
-                if (change->action == TVE_EXPAND) for (HTREEITEM item = TreeView_GetRoot(app.libraryTree); item; item = TreeView_GetNextSibling(app.libraryTree,item))
-                    if (item != change->itemNew.hItem) TreeView_Expand(app.libraryTree,item,TVE_COLLAPSE);
-            } else if (notification->code == TVN_SELCHANGEDW) {
-                auto const* change = reinterpret_cast<NMTREEVIEWW const*>(lParam);
-                if (change->itemNew.lParam > 0)
-                    app.choose_tool(static_cast<Tool>(change->itemNew.lParam - 1));
-            } else if (notification->code == TVN_GETINFOTIPW) {
-                auto* tip = reinterpret_cast<NMTVGETINFOTIPW*>(lParam);
-                int index = static_cast<int>(tip->lParam) - 1;
-                wchar_t const* description = index == DFlipFlopTool ? L"D\uFF1A\u4E0A\u5347\u6CBF\u91C7\u6837\uFF1B\u5DE6\u4FA7 D/CLK/R\uFF0C\u53F3\u4FA7 Q/~Q\uFF1BR=1 \u5F02\u6B65\u590D\u4F4D\u3002" :
-                    index == RSLatchTool ? L"RS\uFF1AS \u7F6E\u4F4D\uFF0CR \u590D\u4F4D\uFF0C\u9AD8\u7535\u5E73\u6709\u6548\uFF0CR \u4F18\u5148\uFF1B\u53F3\u4FA7 Q/~Q\u3002" :
-                    index == ClockTool ? L"\u624B\u52A8\u65F6\u949F\uFF1A\u9009\u62E9\u5DE5\u5177\u4E0B\u5355\u51FB\u5207\u6362 0/1\uFF1B0 \u2192 1 \u4E3A\u4E0A\u5347\u6CBF\u3002PCB \u4F7F\u7528\u5916\u90E8\u65F6\u949F\u63A5\u53E3\u3002" :
-                    index == ConstantTool ? L"\u903B\u8F91\u5E38\u91CF\uFF1A\u5355\u51FB\u5207\u6362 0/1\uFF0C\u5BFC\u51FA\u540E\u5206\u522B\u63A5 GND/+5V\u3002" :
-                    index == HalfAdderTool ? L"\u534A\u52A0\u5668\uFF1A\u4E24\u4E2A\u8F93\u5165\uFF1B\u4E0A\u65B9\u8F93\u51FA\u548C\u4F4D\uFF0C\u4E0B\u65B9\u8F93\u51FA\u8FDB\u4F4D\u3002" :
-                    index == HalfSubtractorTool ? L"\u534A\u51CF\u5668\uFF1A\u4E24\u4E2A\u8F93\u5165\uFF1B\u4E0A\u65B9\u8F93\u51FA\u5DEE\u4F4D\uFF0C\u4E0B\u65B9\u8F93\u51FA\u501F\u4F4D\u3002" :
-                    index == EqualTool ? L"\u76F8\u7B49\u6BD4\u8F83\u5668\uFF1A\u4E24\u4E2A\u8F93\u5165\u76F8\u540C\u65F6\u8F93\u51FA 1\u3002" :
-                    index >= AndTool && index <= XnorTool ? KindNames[index - AndTool] :
-                    L"\u5C55\u5F00\u5206\u7C7B\u5E76\u5355\u51FB\u5143\u4EF6\uFF0C\u5728\u753B\u5E03\u4E0A\u653E\u7F6E\u3002";
-                lstrcpynW(tip->pszText, description, tip->cchTextMax);
-            }
-        }
-        return 0;
-    }
-    case WM_MENUSELECT:
-        app.show_menu_hint(reinterpret_cast<HMENU>(lParam), LOWORD(wParam), HIWORD(wParam));
-        return 0;
-    case WM_EXITMENULOOP:
-        app.show_menu_hint(nullptr, 0xFFFF, 0);
-        return 0;
-    case WM_MEASUREITEM: {
-        auto* item = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
-        if (item && item->CtlType == ODT_MENU) { measure_menu_item(*item); return TRUE; }
-        return DefWindowProcW(window, message, wParam, lParam);
-    }
-    case WM_DRAWITEM: {
-        auto const* item = reinterpret_cast<DRAWITEMSTRUCT const*>(lParam);
-        if (item && item->CtlType == ODT_MENU) { draw_menu_item(*item); return TRUE; }
-        if (item && item->CtlID >= ToolBase && item->CtlID < ToolBase + 7) {
-            draw_toolbar_button(*item);
-            return TRUE;
-        }
-        return DefWindowProcW(window, message, wParam, lParam);
-    }
-    case WM_DESTROY:
-        if (app.menuBrush) DeleteObject(app.menuBrush);
-        if (app.toolbarBrush) DeleteObject(app.toolbarBrush);
-        if (app.uiFont) DeleteObject(app.uiFont);
-        if (app.gateFont) DeleteObject(app.gateFont);
-        PostQuitMessage(0);
-        return 0;
-    default: return DefWindowProcW(window, message, wParam, lParam);
-    }
-}
-
-int run(HINSTANCE instance, int show) {
-    SetProcessDPIAware();
-    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_WIN95_CLASSES};
-    InitCommonControlsEx(&controls);
-    WNDCLASSEXW canvasClass{};
-    canvasClass.cbSize = sizeof(canvasClass);
-    canvasClass.lpfnWndProc = CanvasProcedure;
-    canvasClass.hInstance = instance;
-    canvasClass.lpszClassName = CanvasClass;
-    canvasClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    canvasClass.hbrBackground = static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH));
-    if (!RegisterClassExW(&canvasClass)) return 1;
-    WNDCLASSEXW mainClass{};
-    mainClass.cbSize = sizeof(mainClass);
-    mainClass.lpfnWndProc = MainProcedure;
-    mainClass.hInstance = instance;
-    mainClass.lpszClassName = MainClass;
-    mainClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    mainClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
-    if (!RegisterClassExW(&mainClass)) return 1;
-    int width = std::min(1440, GetSystemMetrics(SM_CXSCREEN) - 80);
-    int height = std::min(900, GetSystemMetrics(SM_CYSCREEN) - 100);
-    HWND window = CreateWindowExW(0, MainClass, L"\u7B80\u6613 Logisim C++", WS_OVERLAPPEDWINDOW,
-                                  (GetSystemMetrics(SM_CXSCREEN) - width) / 2,
-                                  (GetSystemMetrics(SM_CYSCREEN) - height) / 2,
-                                  width, height, nullptr, nullptr, instance, nullptr);
-    if (!window) return 1;
-    ShowWindow(window, show); UpdateWindow(window);
-    ACCEL shortcuts[] = {
-        {FVIRTKEY | FCONTROL, 'N', FileNew}, {FVIRTKEY | FCONTROL, 'O', FileOpen},
-        {FVIRTKEY | FCONTROL, 'S', FileSave},
-        {FVIRTKEY | FCONTROL | FSHIFT, 'S', FileSaveAs},
-        {FVIRTKEY | FCONTROL, 'Q', FileExit},
-        {FVIRTKEY | FCONTROL, 'Z', EditUndo},
-        {FVIRTKEY | FCONTROL, 'A', EditSelectAll},
-        {FVIRTKEY, VK_DELETE, EditDelete}, {FVIRTKEY, 'R', EditRotate},
-        {FVIRTKEY | FCONTROL, VK_OEM_PLUS, ZoomIn},
-        {FVIRTKEY | FCONTROL | FSHIFT, VK_OEM_PLUS, ZoomIn},
-        {FVIRTKEY | FCONTROL, VK_ADD, ZoomIn},
-        {FVIRTKEY | FCONTROL, VK_OEM_MINUS, ZoomOut},
-        {FVIRTKEY | FCONTROL, VK_SUBTRACT, ZoomOut},
-        {FVIRTKEY | FCONTROL, '0', ZoomReset}
-    };
-    HACCEL accelerators = CreateAcceleratorTableW(shortcuts, static_cast<int>(sizeof(shortcuts) / sizeof(shortcuts[0])));
-    MSG message{};
-    while (GetMessageW(&message, nullptr, 0, 0) > 0) {
-        if (!TranslateAcceleratorW(window, accelerators, &message)) {
-            TranslateMessage(&message); DispatchMessageW(&message);
-        }
-    }
-    DestroyAcceleratorTable(accelerators);
-    return static_cast<int>(message.wParam);
-}
-
+};
 } // namespace
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
-    return run(instance, show);
-}
+wxIMPLEMENT_APP_NO_MAIN(LogisimApplication);
 
-int main() {
-    return run(GetModuleHandleW(nullptr), SW_SHOWDEFAULT);
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR, int show) {
+    return wxEntry(instance,previous,nullptr,show);
 }
+int main() { return wxEntry(GetModuleHandleW(nullptr),nullptr,nullptr,SW_SHOWDEFAULT); }
